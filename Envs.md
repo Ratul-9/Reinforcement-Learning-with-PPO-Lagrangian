@@ -74,7 +74,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 20 checks, run after any change
+python test_envs.py                        # 22 checks, run after any change
 python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
@@ -149,20 +149,45 @@ World.build({"kind": "roundabout_yield", "radius": 28.0, "arms": 5, "lanes": 3})
 | goal reached | `+1.0`, episode ends |
 
 **Cost** — `info["cost"]`, one `(n_agents,)` array per channel, all
-non-negative, all unweighted:
+non-negative, all unweighted, **all bounded to [0, 1] per step**:
 
-| channel | fires when |
-|---|---|
-| `collision` | footprint overlaps another vehicle, a building or a tree. Episode ends |
-| `offroad` | outside the drivable surface. Episode ends after 1.5 s |
-| `wrong_way` | in a lane that runs the other way |
-| `lane_keep` | off the centre of its own lane, ramped past a dead band |
-| `ttc` | constant-velocity time-to-collision under 2 s, ramped |
-| `jerk` | jerk over 5 m/s³, ramped |
-| `speeding` | over 50 km/h, ramped |
+| channel | fires when | a budget reads as |
+|---|---|---|
+| `collision` | footprint overlaps another vehicle, a building or a tree. Episode ends | collisions per episode |
+| `offroad` | outside the drivable surface. Episode ends after 1.5 s | steps off the road |
+| `wrong_way` | in a lane that runs the other way | steps in the wrong lane |
+| `lane_keep` | off its own lane's centre, ramped past a dead band | steps at full drift |
+| `ttc` | constant-velocity time-to-collision under 2 s, ramped | steps of imminent conflict |
+| `jerk` | filtered jerk over 2.5 m/s³, ramped | steps at full harshness |
+| `speeding` | over 50 km/h, ramped | steps at double the limit |
+
+### Why the [0, 1] bound matters
+
+An episode's cost `J_c` is the sum over its steps, so a bounded per-step
+cost gives `J_c` a unit anyone can read — which is the whole interpretable-
+budget claim. Unbounded channels destroy it. Before the bound was enforced,
+`jerk` hit 21.3 in one step and totalled 2160 over a window where the entire
+reward totalled 4.4: `λ_jerk` would have had to converge near 1e-3 while
+`λ_collision` sat near 1, and at six simultaneous constraints that spread is
+how plain dual ascent oscillates into a do-nothing policy.
+
+Measured per active agent-step with the scripted driver, the channels now
+span 0.005 (`collision`) to 0.54 (`lane_keep`) — and that remaining spread
+is real rather than an artefact: collisions are rare events, lane drift is
+continuous.
+
+### Jerk is measured from smoothed acceleration
+
+Differencing raw step-to-step acceleration measures the control rate, not
+the ride: at a 0.1 s control period a 5 m/s³ threshold trips whenever
+acceleration moves 0.5 m/s² in one step, which every 10 Hz policy does
+constantly. Acceleration is low-passed (τ = 0.3 s) before differencing, and
+the threshold is then a real comfort figure. Held throttle is one continuous
+acceleration and is not charged; a throttle-to-brake reversal is.
 
 All seven are exercised by `test_envs.py`, one test each, asserting both
-that the channel fires and that the ramped ones ramp. A cost channel that
+that the channel fires and that the ramped ones ramp, plus one test holding
+every channel inside [0, 1] under random actions. A cost channel that
 can never fire is a constraint whose multiplier goes to zero and a result
 that quietly means nothing.
 

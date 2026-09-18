@@ -83,13 +83,59 @@ LOOKAHEAD_FAR = 18.0
 # The constrained-MDP cost channels, in one place: the env emits exactly
 # these, one Lagrange multiplier and one budget `d_i` belongs to each, and a
 # learner can enumerate them without hard-coding the names a second time.
+#
+# EVERY CHANNEL IS BOUNDED TO [0, 1] PER STEP. That is not tidiness, it is
+# what makes a budget writable. An episode's cost J_c is the sum over its
+# steps, so a bounded per-step cost gives J_c a unit anyone can read:
+#
+#   collision   events per episode        "<= 0.01 collisions"
+#   offroad     step-equivalents off it   "<= 5 steps, i.e. 0.5 s"
+#   wrong_way   step-equivalents          "<= 20 steps in the wrong lane"
+#   lane_keep   step-equivalents at full  "<= 30 steps of maximum drift"
+#   ttc         step-equivalents at zero  "<= 10 steps of imminent conflict"
+#   jerk        step-equivalents at full  "<= 15 steps of maximum harshness"
+#   speeding    step-equivalents at 2x    "<= 5 steps at double the limit"
+#
+# Unbounded channels break that. Before this was enforced, `jerk` reached
+# 21.3 in a single step and totalled 2160 over a window where the whole
+# reward totalled 4.4 — so lambda_jerk would have had to converge near 1e-3
+# while lambda_collision sat near 1, and with six simultaneous constraints
+# that spread is how plain dual ascent oscillates into a degenerate policy.
+# The budget is also the number the paper claims is interpretable; a budget
+# in units of "unclamped ramped jerk" is not.
 COST_CHANNELS = ("collision", "offroad", "wrong_way", "lane_keep",
                  "ttc", "jerk", "speeding")
 
 # -- cost thresholds (what counts as a violation, NOT what it is worth) ---
 TTC_THRESHOLD = 2.0          # seconds; below this the TTC cost is charged
-JERK_THRESHOLD = 5.0         # m/s^3
 SPEED_LIMIT = 13.9           # m/s (50 km/h)
+
+# Comfort. Jerk is measured from a SMOOTHED acceleration, not from the raw
+# step-to-step difference, and the smoothing is the whole point: at a 0.1 s
+# control period, differencing raw acceleration turns the controller's own
+# quantisation into jerk. A 5 m/s^3 threshold on that trips whenever
+# acceleration moves 0.5 m/s^2 in one step, which every 10 Hz policy does
+# constantly — it was measuring the control rate, not the ride.
+#
+# The filter time constant is the shortest change a passenger actually feels
+# as a jolt rather than as steady acceleration; the threshold is then a real
+# comfort figure rather than a number chosen to make the cost quiet.
+JERK_TAU = 0.3               # s, acceleration low-pass time constant
+JERK_THRESHOLD = 2.5         # m/s^3 of FILTERED jerk
+
+
+def _ramp(value: float, threshold: float) -> float:
+    """A violation's severity as a number in [0, 1]: zero at the threshold,
+    one at twice it, flat after that.
+
+    Ramped rather than flat because a flat charge is as bad at 31 km/h as at
+    90, which leaves a policy that has already overshot no reason to come
+    back down. Clamped rather than open-ended for the reason above the
+    channel list.
+    """
+    if threshold <= 0.0:
+        return float(value > 0.0)
+    return float(min(max(value - threshold, 0.0) / threshold, 1.0))
 
 
 class TrafficEnv(gym.Env):
@@ -157,7 +203,7 @@ class TrafficEnv(gym.Env):
         self._route0 = np.ones(self.n_agents)
         self._route_prev = np.ones(self.n_agents)
         self._offroad_for = np.zeros(self.n_agents)
-        self._accel_prev = np.zeros(self.n_agents)
+        self._accel_filt = np.zeros(self.n_agents)
         # Per-agent, not global. With staggered arrivals every vehicle is at
         # a different point of its own episode, so one shared step counter
         # would time all of them out together — re-synchronising exactly what
@@ -173,7 +219,7 @@ class TrafficEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self._offroad_for[:] = 0.0
-        self._accel_prev[:] = 0.0
+        self._accel_filt[:] = 0.0
         self._age[:] = 0
         self._active[:] = False
 
@@ -266,7 +312,7 @@ class TrafficEnv(gym.Env):
         self._route0[i] = max(route, 1.0)
         self._route_prev[i] = route
         self._offroad_for[i] = 0.0
-        self._accel_prev[i] = 0.0
+        self._accel_filt[i] = 0.0
         return True
 
     def _snap_to_lane(self, x: float, y: float, goal, fallback: float):
@@ -402,20 +448,26 @@ class TrafficEnv(gym.Env):
             fix = self.world.locate_lane(veh.x, veh.y, veh.heading)
             if margin >= 0.0:
                 costs["wrong_way"][i] = float(fix.wrong_way)
+                # Saturating at one slack-width past the dead band is not a
+                # loss: by then the vehicle is most of a lane out, and
+                # whatever it does next is already being charged as
+                # wrong_way or offroad.
                 slack = max(fix.lane.width / 2.0 - self.half_width, 0.25)
-                costs["lane_keep"][i] = max(0.0, abs(fix.offset) - slack) / slack
+                costs["lane_keep"][i] = _ramp(abs(fix.offset), slack)
 
             ttc = self._time_to_collision(i, moving)
             if ttc < TTC_THRESHOLD:
                 costs["ttc"][i] = 1.0 - ttc / TTC_THRESHOLD
 
             accel = (veh.vx - speed_before[i]) / self.dt
-            jerk = abs(accel - self._accel_prev[i]) / self.dt
-            self._accel_prev[i] = accel
-            costs["jerk"][i] = max(0.0, jerk - JERK_THRESHOLD) / JERK_THRESHOLD
+            alpha = self.dt / (JERK_TAU + self.dt)
+            filtered = self._accel_filt[i] + alpha * (accel - self._accel_filt[i])
+            jerk = abs(filtered - self._accel_filt[i]) / self.dt
+            self._accel_filt[i] = filtered
+            costs["jerk"][i] = _ramp(jerk, JERK_THRESHOLD)
 
             speed = math.hypot(veh.vx, veh.vy)
-            costs["speeding"][i] = max(0.0, speed - SPEED_LIMIT) / SPEED_LIMIT
+            costs["speeding"][i] = _ramp(speed, SPEED_LIMIT)
 
             events.append(event)
 

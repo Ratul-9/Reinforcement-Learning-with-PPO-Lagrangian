@@ -341,6 +341,48 @@ def test_all_on_mode_disables_staggering():
     assert info["active"].all(), "initial_active=1.0 left someone waiting"
 
 
+def test_costs_are_bounded():
+    """Every channel must stay in [0, 1] per step, under any behaviour.
+
+    This is what makes a budget writable: with a bounded per-step cost, the
+    episode sum J_c has a unit a human can read ("<= 5 steps off the road"),
+    and no single channel's multiplier has to live orders of magnitude away
+    from the others. An unbounded channel silently reintroduces exactly the
+    arbitrary weighting the method exists to remove.
+    """
+    from envs.traffic_env import COST_CHANNELS
+
+    env = TrafficEnv("manhattan", n_agents=12, seed=3, **ALL_ON)
+    obs, _ = env.reset()
+    peak = {k: 0.0 for k in COST_CHANNELS}
+    for _ in range(200):
+        obs, _r, _t, _tr, info = env.step(
+            [env.action_space.sample() for _ in range(12)])
+        for k in COST_CHANNELS:
+            channel = info["cost"][k]
+            assert np.all(channel >= 0.0), f"{k} went negative"
+            assert np.all(channel <= 1.0), f"{k} exceeded 1.0: {channel.max()}"
+            peak[k] = max(peak[k], float(channel.max()))
+    assert peak["jerk"] > 0.0, "random actions produced no jerk at all"
+
+
+def test_jerk_ignores_control_rate():
+    """Jerk must be measured from a SMOOTHED acceleration.
+
+    Held full throttle is one continuous acceleration and must not be
+    charged, however fast the controller is ticking. Differencing raw
+    step-to-step acceleration charged it anyway — it was measuring the 10 Hz
+    control period rather than the ride.
+    """
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
+    env.reset()
+    steady = 0.0
+    for _ in range(30):
+        _, _, _, _, info = env.step([drive(throttle=0.35)])
+        steady = max(steady, float(info["cost"]["jerk"][0]))
+    assert steady < 0.5, f"steady acceleration charged as jerk: {steady}"
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be
