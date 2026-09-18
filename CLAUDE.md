@@ -35,8 +35,8 @@ someone else's (Ratul), written against `Handoff.md`.
 - **Always `conda run -n py310 python ...`** — never base/system Python.
 - **No Claude attribution** in commits or PRs. No `Co-Authored-By`, no
   generated-with footer. Four commits were rewritten once to strip them.
-- Run `conda run -n py310 python test_envs.py` after any change — 30 checks,
-  ~60 s. It is the contract and the regression net.
+- Run `conda run -n py310 python test_envs.py` after any change — 37 checks,
+  ~90 s. It is the contract and the regression net.
 - `figures/` is gitignored; regenerate with `python figures.py`.
 
 ## Lineage
@@ -147,7 +147,7 @@ Worth knowing, because each was invisible until something specific was built.
 ## Running things
 
 ```bash
-conda run -n py310 python test_envs.py       # 30 checks — run after any change
+conda run -n py310 python test_envs.py       # 37 checks — run after any change
 conda run -n py310 python rollout.py         # scripted driver, all 8 scenarios
 conda run -n py310 python figures.py         # presentation renders -> figures/
 conda run -n py310 python fleet.py           # the vehicle table
