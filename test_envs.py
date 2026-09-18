@@ -244,6 +244,53 @@ def test_lane_keep_cost_fires():
     assert charged[2] > charged[1] > 0.0, f"cost did not ramp: {charged}"
 
 
+def test_speeding_cost_fires():
+    """Over the limit must charge, and charge more the further over."""
+    from envs.traffic_env import SPEED_LIMIT
+
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
+    env.reset()
+    veh = env.vehicles[0]
+    charged = []
+    for speed in (SPEED_LIMIT * 0.9, SPEED_LIMIT * 1.2, SPEED_LIMIT * 1.5):
+        veh.vx = speed
+        _, _, _, _, info = env.step([drive(throttle=0.0)])
+        charged.append(float(info["cost"]["speeding"][0]))
+    assert charged[0] == 0.0, "charged under the limit"
+    assert charged[2] > charged[1] > 0.0, f"cost did not ramp: {charged}"
+
+
+def test_ttc_cost_fires():
+    """Closing head-on with a stationary vehicle must charge the TTC cost,
+    and charge more the closer the conflict is."""
+    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare())
+    env.reset()
+    a, b = env.vehicles
+    charged = []
+    for gap in (60.0, 25.0, 14.0):
+        a.vx = 10.0
+        b.x = a.x + math.cos(a.heading) * gap
+        b.y = a.y + math.sin(a.heading) * gap
+        b.heading, b.vx = a.heading, 0.0
+        _, _, _, _, info = env.step([drive(throttle=0.0), drive(throttle=0.0)])
+        charged.append(float(info["cost"]["ttc"][0]))
+    assert charged[0] == 0.0, "charged for a conflict six seconds away"
+    assert charged[2] > charged[1] > 0.0, f"cost did not ramp: {charged}"
+
+
+def test_jerk_cost_fires():
+    """A hard throttle-to-brake reversal must charge the comfort cost."""
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
+    env.reset()
+    env.vehicles[0].vx = 8.0
+    charged = 0.0
+    for action in (drive(throttle=1.0), drive(throttle=0.0, brake=1.0),
+                   drive(throttle=1.0)):
+        _, _, _, _, info = env.step([action])
+        charged = max(charged, float(info["cost"]["jerk"][0]))
+    assert charged > 0.0, "jerk cost never fired on a throttle-brake reversal"
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be

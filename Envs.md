@@ -48,7 +48,8 @@ Everything is a list of length `n_agents`: this IS the vectorised interface,
 with the shared world as the only coupling between agents.
 
 ```bash
-python test_envs.py                        # 15 checks, run after any change
+python test_envs.py                        # 18 checks, run after any change
+python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
 python -m envs.png_map intersection_x      # intersection_x_map.png — a paintable map
@@ -134,9 +135,10 @@ non-negative, all unweighted:
 | `jerk` | jerk over 5 m/s³, ramped |
 | `speeding` | over 50 km/h, ramped |
 
-Every one of these is exercised by `test_envs.py` — a cost channel that can
-never fire is a constraint whose multiplier goes to zero and a result that
-quietly means nothing.
+All seven are exercised by `test_envs.py`, one test each, asserting both
+that the channel fires and that the ramped ones ramp. A cost channel that
+can never fire is a constraint whose multiplier goes to zero and a result
+that quietly means nothing.
 
 The thresholds above say **what counts as a violation**. That is a modelling
 decision worth owning. What a violation is *worth* is not set here.
@@ -302,6 +304,27 @@ The port is byte-identical to `LANCER3D-dev/sim/world/road_network.py` on
 purpose: it is pure numpy geometry with no Panda3D or Qt import, it is the
 most load-bearing file here, and keeping it diffable against its origin is
 worth more than tidying its heading convention.
+
+---
+
+## Route waypoints are on the centreline, not in a lane
+
+`route_probe` returns points on the road's **centreline**, so a controller
+that tracks the waypoint perfectly drives down the middle of the
+carriageway — and on a two-way road that is the wrong lane half the time.
+`rollout.py`'s pure-pursuit driver shows it plainly: 0.19–0.37 wrong-way
+cost per agent-step, almost all of it from exactly this.
+
+This is a live design decision, not a bug:
+
+- **Leave it.** The policy sees `lane_offset` and `wrong_way` in its
+  observation and the two lane costs in its budget, so it can learn the
+  offset itself. Harder problem, more honest one.
+- **Offset the waypoints into the correct lane.** Makes lane keeping nearly
+  free and removes most of what `lane_keep` was there to measure.
+
+Whichever is chosen should be chosen deliberately, because it changes what
+the lane constraints are worth as a result.
 
 ---
 
