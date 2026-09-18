@@ -15,6 +15,8 @@ constraint budgets instead of a developer picking them.
 ```
 envs/
   road_network.py   graph of centrelines, routing, 8 scenario builders
+  lanes.py          discrete lanes derived from each piece's lane count
+  bays.py           parking bays attached to any network; bay-to-bay task
   scenery.py        buildings and trees, placed procedurally off the graph
   world.py          network + scenery + collision tests + heading conversion
   sensors.py        analytic lidar / radar against that geometry
@@ -46,7 +48,7 @@ Everything is a list of length `n_agents`: this IS the vectorised interface,
 with the shared world as the only coupling between agents.
 
 ```bash
-python test_envs.py                        # 11 checks, run after any change
+python test_envs.py                        # 15 checks, run after any change
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
 python -m envs.png_map intersection_x      # intersection_x_map.png — a paintable map
@@ -62,7 +64,7 @@ widths across its pieces.
 
 | kind | what it is |
 |---|---|
-| `parking_lot` | perimeter loop, aisles, one-lane bays. Manoeuvring speed; "leave one bay, reach another" |
+| `parking_lot` | perimeter loop, aisles, one-lane bays. Manoeuvring speed |
 | `intersection_x` | unsignalised crossings of an arterial and side streets |
 | `merge_ramp` | on-ramp merging into a carriageway |
 | `roundabout_yield` | four-arm roundabout with a non-drivable island |
@@ -74,6 +76,32 @@ widths across its pieces.
 Six generic layouts (`cross`, `tee`, `grid`, `roundabout`, `loop`, `town`)
 also exist for "can it drive at all" testing. `road_network.KINDS` lists all
 fourteen; `road_network.SCENARIO_KINDS` just the eight.
+
+### The task is bay to bay, everywhere
+
+Every scenario gets parking bays attached (`envs/bays.py`) and they become
+its sources and goals, so the episode is always "leave a parking space,
+drive the scenario, park in another one". Bays inherit the positions of
+whatever endpoints the scenario declared, so the route still enters the
+merge from the ramp and still crosses the unsignalised junction — it just
+now starts and ends stationary, which is the part a road-to-road task never
+exercises. Another ~18 bays are scattered for the rest of the traffic.
+
+`World.build(..., bays=False)` turns this off; `parking_lot` already is bays
+and is left alone.
+
+### Lanes
+
+`envs/lanes.py` derives lane centrelines from each piece's lane count rather
+than storing them, so a network from any source — a builder, a PNG — gets
+lanes without knowing lanes exist. Right-hand traffic: a lane on the right
+half runs along the piece's tangent, one on the left runs against it. One
+lane means a bidirectional bay or aisle. An odd count puts a **shared
+turning lane** on the centreline, direction 0, which is never a wrong-way
+violation.
+
+Both renderers paint one dashed divider per lane boundary, so what is drawn
+is what `lane_keep` is measured against.
 
 Geometry parameters are ordinary spec fields, so a sweep widens a
 carriageway or adds an arm without touching a builder:
@@ -100,7 +128,8 @@ non-negative, all unweighted:
 |---|---|
 | `collision` | footprint overlaps another vehicle, a building or a tree. Episode ends |
 | `offroad` | outside the drivable surface. Episode ends after 1.5 s |
-| `lane` | on the wrong side of the centreline for the direction of travel |
+| `wrong_way` | in a lane that runs the other way |
+| `lane_keep` | off the centre of its own lane, ramped past a dead band |
 | `ttc` | constant-velocity time-to-collision under 2 s, ramped |
 | `jerk` | jerk over 5 m/s³, ramped |
 | `speeding` | over 50 km/h, ramped |
@@ -118,14 +147,19 @@ decision worth owning. What a violation is *worth* is not set here.
 
 ```python
 {
-  "state":      (8,)   vx, vy, yaw_rate, steering, gear,
-                       road_margin, lateral_offset, heading_error
+  "state":      (10,)  vx, vy, yaw_rate, steering, gear, road_margin,
+                       heading_error, lane_offset, lane_index, wrong_way
   "navigation": (6,)   route_distance, near waypoint (fwd, left),
                        far waypoint (fwd, left), bend ahead
   "lidar":      (120,) ranges, 360° sweep, 100 m
   "radar":      (5, 4) nearest 5 movers: fwd, left, rel fwd speed, rel left speed
 }
 ```
+
+`lane_offset` is measured from the centre of the vehicle's OWN lane, not
+from the road's centreline: on a three-lane arterial a correctly-driven
+vehicle is several metres off the centreline, and that number says nothing
+about whether it is driving well.
 
 Deliberately **no absolute x/y**. A policy given its world coordinates
 memorises the map; one given a route waypoint and a lane offset learns to
@@ -207,6 +241,10 @@ exact palette colours and the class is what it means.
 | tree | `#2f7a2a` | tree |
 | source | `#2b7fd9` | an episode start point |
 | goal | `#c43b3b` | an episode destination |
+| endpoint | `#9b59b6` | both — a parking bay, usable either way |
+
+Marker pixels count as drivable: a source is a point a vehicle stands on, so
+painting one is a dot *on* the road, not a hole in it.
 
 Paint one in any image editor and `load` recovers a routable graph: the
 asphalt mask is skeletonised to a medial axis, skeleton pixels are classed by
@@ -219,8 +257,12 @@ the nearest lane, buildings (position, footprint, yaw), trees, sources,
 goals. Not preserved: arcs (they return as chains of chords, which every
 `RoadNetwork` query handles natively), building and tree *heights* (a
 top-down map cannot carry them — the loader re-rolls them), and sub-pixel
-geometry. Measured road length after a round trip lands within about 6% of
-the original.
+geometry, and **parking bays lose most of their stub length** — a short wide
+protrusion is largely absorbed into its parent road's medial axis, so the
+loader rebuilds the stub from the surviving marker dot instead. Measured road
+length after a round trip lands within 6% on a bay-free network and 10-25%
+on one with bays; every source and goal comes back standing on drivable
+surface, which is the property that matters and the one the test asserts.
 
 ---
 
@@ -268,6 +310,14 @@ worth more than tidying its heading convention.
 - **No traffic lights, right-of-way rules, or pedestrians.** The scenarios
   are collision-prone by geometry, which is enough for the constraints to
   bite; signals would add a discrete state to the observation space.
+- **No staggered spawning.** All vehicles spawn at reset and respawn the
+  instant they finish. The spec wants arrivals spread over time so conflicts
+  emerge; that needs a spawn queue and a per-agent active flag.
+- **No pedestrians, no per-episode layout variation.** Both agreed as
+  wanted; neither is built.
+- **No metrics recorder and no learner-facing adapter.** `info` emits
+  per-step costs; nothing aggregates them per episode, and `step` takes and
+  returns lists rather than the shape SB3 or PettingZoo expects.
 - **One vehicle type.** `TrafficEnv(vehicle_cls=...)` takes any class with
   `Sedan`'s interface, but only `Sedan` exists so far.
 - **Arcs are lost through a PNG round trip** (see above).

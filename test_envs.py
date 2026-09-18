@@ -19,6 +19,15 @@ from envs.traffic_env import TrafficEnv
 from vehicle import Gear
 
 
+def bare(kind="cross", seed=0):
+    """A world with no bays and no scenery — a plain road to stage a single
+    cost on. Bays are one lane wide and therefore bidirectional, so a vehicle
+    that spawns in one can never be wrong-way, and a test that wants to
+    provoke that cost has to start on a real two-way road."""
+    return World.build(kind, rng=np.random.default_rng(seed),
+                       scenery_density=0.0, bays=False)
+
+
 def drive(throttle=0.6, steering=0.0, brake=0.0, gear=3):
     return {"steering": np.array([steering], dtype=np.float32),
             "throttle": np.array([throttle], dtype=np.float32),
@@ -67,7 +76,7 @@ def test_lidar_matches_geometry():
 
 
 def test_overlap_tests():
-    world = World.build("cross", rng=np.random.default_rng(0), scenery_density=0.0)
+    world = bare()
     a = (0.0, 0.0, 2.5, 1.0, 0.0)
     # Overlapping, touching-but-rotated, and clear.
     near = np.array([[3.0, 0.0, 2.5, 1.0, 0.0],
@@ -82,7 +91,7 @@ def test_overlap_tests():
 def test_offroad_cost_fires():
     """Drive straight off the side of the road and the off-road cost must
     charge, then the episode must end once the grace window is used up."""
-    env = TrafficEnv("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
     env.reset()
     veh = env.vehicles[0]
     # Point it across the carriageway rather than along it.
@@ -101,7 +110,7 @@ def test_offroad_cost_fires():
 
 def test_collision_cost_fires():
     """Two vehicles placed nose to nose must register a collision."""
-    env = TrafficEnv("cross", n_agents=2, seed=0, scenery_density=0.0)
+    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare())
     env.reset()
     a, b = env.vehicles
     b.x, b.y, b.heading = a.x + 1.0, a.y, a.heading
@@ -112,7 +121,7 @@ def test_collision_cost_fires():
 
 def test_progress_reward_is_signed_by_direction():
     """Driving along the route must pay; driving away from it must not."""
-    env = TrafficEnv("cross", n_agents=1, seed=2, scenery_density=0.0)
+    env = TrafficEnv("cross", n_agents=1, seed=2, world=bare(seed=2))
     env.reset()
     veh = env.vehicles[0]
     goal = tuple(env._goals[0])
@@ -198,7 +207,7 @@ def test_wrong_way_cost_fires():
     mistakes and each gets its own multiplier."""
     from envs.traffic_env import TrafficEnv as Env
 
-    env = Env("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env = Env("cross", n_agents=1, seed=0, world=bare())
     env.reset()
     veh = env.vehicles[0]
     veh.heading += math.pi                       # same lane, facing back
@@ -212,7 +221,7 @@ def test_lane_keep_cost_fires():
     lane-keeping cost must charge and grow with the error."""
     from envs.traffic_env import TrafficEnv as Env
 
-    env = Env("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env = Env("cross", n_agents=1, seed=0, world=bare())
     env.reset()
     veh = env.vehicles[0]
     fix = env.world.locate_lane(veh.x, veh.y, veh.heading)
@@ -253,8 +262,18 @@ def test_png_round_trip():
     assert len(loaded.scenery.boxes) == len(world.scenery.boxes)
     assert len(loaded.net.sources) == len(world.net.sources)
     assert len(loaded.net.goals) == len(world.net.goals)
+
+    # The assertion that matters is not how long the roads are, it is that
+    # every endpoint came back STANDING ON ONE. Parking bays lose some of
+    # their length through a round trip — a short wide stub is largely
+    # absorbed into its parent road's medial axis — so the length tolerance
+    # is loose on purpose, while "can a vehicle actually start here" is not.
+    for x, y, _h in loaded.net.sources:
+        assert loaded.net.is_on_road(x, y), "source loaded off the road"
+    for x, y in loaded.net.goals:
+        assert loaded.net.is_on_road(x, y), "goal loaded off the road"
     ratio = loaded.net.total_length / world.net.total_length
-    assert 0.9 < ratio < 1.2, f"road length changed by {ratio:.2f}x"
+    assert 0.7 < ratio < 1.2, f"road length changed by {ratio:.2f}x"
 
     env = Env("intersection_x", n_agents=4, seed=0, world=loaded)
     env.reset()

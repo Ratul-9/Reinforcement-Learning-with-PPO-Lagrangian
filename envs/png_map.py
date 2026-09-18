@@ -18,6 +18,17 @@ routable road network with buildings, trees, and episode endpoints.
     tree        #2f7a2a    tree
     source      #2b7fd9    an episode start point
     goal        #c43b3b    an episode destination
+    endpoint    #9b59b6    BOTH — a parking bay, usable either way
+
+Marker pixels count as drivable. A source or goal is a point a vehicle
+stands on, so painting one is painting a dot ON the road, not punching a
+hole in it — the loader ORs the three marker classes into the asphalt mask
+before skeletonising. Without that, a bay marked at the end of its stub
+loses the end of the stub and the bay stops being reachable.
+
+`endpoint` exists because once bays are attached every bay is both a source
+and a goal, and with only two marker colours whichever was painted second
+would erase the other.
 
 ## How painted asphalt becomes a graph
 
@@ -65,14 +76,22 @@ BUILDING = (0x8d, 0x85, 0x79)
 TREE = (0x2f, 0x7a, 0x2a)
 SOURCE = (0x2b, 0x7f, 0xd9)
 GOAL = (0xc4, 0x3b, 0x3b)
+ENDPOINT = (0x9b, 0x59, 0xb6)
 
 PALETTE = {"grass": GRASS, "asphalt": ASPHALT, "building": BUILDING,
-           "tree": TREE, "source": SOURCE, "goal": GOAL}
+           "tree": TREE, "source": SOURCE, "goal": GOAL, "endpoint": ENDPOINT}
+
+# Marker classes that are also road surface.
+MARKER_CLASSES = ("source", "goal", "endpoint")
 
 DEFAULT_PX_PER_M = 2.0
+_RECONNECT_GAP = 1.0      # see `_connect`
 RDP_TOLERANCE_M = 1.2     # how far a simplified chain may stray from the skeleton
 MIN_PIECE_M = 3.0         # shorter runs than this are junction noise, not roads
-MARKER_RADIUS_M = 2.0     # how big a source/goal dot is drawn by `save`
+# Marker dot radius. Small on purpose: `parking_lot`'s bays sit a few metres
+# apart, and two dots that touch merge into one connected component, which
+# loads back as one endpoint instead of two.
+MARKER_RADIUS_M = 1.0
 
 
 # ── PNG out ──────────────────────────────────────────────────────────────
@@ -125,10 +144,18 @@ def save(world: World, path: str, px_per_m: float = DEFAULT_PX_PER_M) -> str:
     for cx, cy, r, _h in world.scenery.trees:
         stamp_disc(float(cx), float(cy), float(r), TREE)
 
+    # A point in both lists is a parking bay and gets the combined colour;
+    # painting it twice would just lose whichever went down first.
+    goals = {(round(gx, 3), round(gy, 3)) for gx, gy in world.net.goals}
+    both = set()
     for sx, sy, _h in world.net.sources:
-        stamp_disc(sx, sy, MARKER_RADIUS_M, SOURCE)
+        key = (round(sx, 3), round(sy, 3))
+        if key in goals:
+            both.add(key)
+        stamp_disc(sx, sy, MARKER_RADIUS_M, ENDPOINT if key in goals else SOURCE)
     for gx, gy in world.net.goals:
-        stamp_disc(gx, gy, MARKER_RADIUS_M, GOAL)
+        if (round(gx, 3), round(gy, 3)) not in both:
+            stamp_disc(gx, gy, MARKER_RADIUS_M, GOAL)
 
     Image.fromarray(img).save(path)
     return path
@@ -249,7 +276,7 @@ def _trace_skeleton(skel: np.ndarray):
             yield np.array(path, dtype=float)
 
 
-def _components(mask: np.ndarray, min_px: int = 6):
+def _components(mask: np.ndarray, min_px: int = 3):
     """Connected components of a boolean mask, as label images."""
     import cv2
 
@@ -270,7 +297,13 @@ def load(path: str, px_per_m: float = DEFAULT_PX_PER_M,
 
     rng = rng or np.random.default_rng(0)
     masks = _masks(path)
-    road = masks["asphalt"]
+    # Markers sit ON the road: a source or goal is somewhere a vehicle
+    # stands. Leaving them out of the mask punches a hole in the tarmac
+    # under every marker, which at the end of a parking bay removes the
+    # part of the stub the bay is reached through.
+    road = masks["asphalt"].copy()
+    for name in MARKER_CLASSES:
+        road |= masks[name]
     if not road.any():
         raise ValueError(f"{path}: no asphalt-coloured pixels — nothing drivable")
 
@@ -328,16 +361,18 @@ def load(path: str, px_per_m: float = DEFAULT_PX_PER_M,
         raise ValueError(f"{path}: asphalt found but no road longer than "
                          f"{MIN_PIECE_M} m — is px_per_m right?")
 
-    for where in _components(masks["source"]):
+    combined = masks["endpoint"]
+    for where in _components(masks["source"] | combined):
         rc = np.argwhere(where).mean(axis=0)
         x, y = to_world(rc)[0]
+        x, y = _connect(net, float(x), float(y), lane_width)
         # A painted dot says WHERE, not which way; the heading is taken from
         # the road it sits on, which is the only direction it could mean.
-        net.add_source(float(x), float(y), _heading_deg_from_net(net, x, y))
-    for where in _components(masks["goal"]):
+        net.add_source(x, y, _heading_deg_from_net(net, x, y))
+    for where in _components(masks["goal"] | combined):
         rc = np.argwhere(where).mean(axis=0)
         x, y = to_world(rc)[0]
-        net.add_goal(float(x), float(y))
+        net.add_goal(*_connect(net, float(x), float(y), lane_width))
 
     net.finalize()
 
@@ -363,6 +398,42 @@ def load(path: str, px_per_m: float = DEFAULT_PX_PER_M,
     objects = scenery.Scenery(np.array(boxes or np.zeros((0, 6))),
                               np.array(trees or np.zeros((0, 4))))
     return World(net, objects, dict(net.spec))
+
+
+def _connect(net, x: float, y: float, lane_width: float) -> tuple[float, float]:
+    """Make sure a marker is reachable, adding a one-lane stub if it is not.
+
+    A parking bay is a short, wide protrusion off a much wider road, and
+    skeletonising one does not reliably leave a branch: the medial axis of a
+    5.5 m bump on a 10 m slab is mostly absorbed into the slab's own axis, so
+    a map round-tripped through `save` lost every bay it had. The marker
+    dot survives that, though, and a marker that ends up off the recovered
+    graph is exactly a bay whose stub was absorbed — so the stub is rebuilt
+    from the marker rather than recovered from the pixels.
+
+    Returns the (possibly unchanged) marker position.
+    """
+    from envs.bays import _split, _nearest_straight
+
+    if not net.pieces:
+        return x, y
+    # The test is the on-road test the env itself uses, not distance to a
+    # centreline. A bay whose stub was half absorbed leaves a short branch
+    # the marker is *near* — near enough for a centreline test to call it
+    # connected — while the marker itself sits several metres past the end
+    # of any drivable surface, which is an episode that starts off-road.
+    if net.road_margin(x, y) >= 0.0:
+        return x, y
+
+    piece_index, s = _nearest_straight(net, x, y, gap=_RECONNECT_GAP)
+    if piece_index is None:
+        return x, y
+    node = _split(net, piece_index, s, gap=_RECONNECT_GAP)
+    if node is None:
+        return x, y
+    end = net.add_node(x, y, "end")
+    net.add_straight(node, end, 1)
+    return x, y
 
 
 def _heading_deg_from_net(net, x: float, y: float) -> float:

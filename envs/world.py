@@ -68,13 +68,22 @@ class World:
 
     @classmethod
     def build(cls, spec="cross", rng: np.random.Generator | None = None,
-              scenery_density: float = 1.0) -> "World":
+              scenery_density: float = 1.0, bays: bool = True) -> "World":
         """Build from a road spec (a kind name like `"roundabout_yield"`, or a
         full spec dict). Scenery placement is seeded, so the same spec and the
-        same seed give the same town every time."""
+        same seed give the same town every time.
+
+        `bays=True` attaches parking bays and makes them the episode
+        endpoints, so every scenario runs the same bay-to-bay task. Bays go on
+        BEFORE the scenery, so buildings and trees treat them as road and
+        keep clear. `parking_lot` already is bays, and is left alone.
+        """
         if rng is None:
             rng = np.random.default_rng(0)
         net = road_network.build(spec)
+        if bays and net.spec.get("kind") != "parking_lot":
+            from envs import bays as bays_mod
+            net = bays_mod.attach(net, rng)
         objects = scenery.generate(net, rng, density=scenery_density)
         full = dict(net.spec)
         full["scenery_density"] = scenery_density
