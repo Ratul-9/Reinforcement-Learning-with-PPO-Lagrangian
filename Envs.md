@@ -17,7 +17,8 @@ envs/
   road_network.py   graph of centrelines, routing, 8 scenario builders
   lanes.py          discrete lanes derived from each piece's lane count
   bays.py           parking bays attached to any network; bay-to-bay task
-  scenery.py        buildings and trees, placed procedurally off the graph
+  perimeter.py      ring road closing every dangling arm
+  scenery.py        buildings and trees set out along street frontages
   world.py          network + scenery + collision tests + heading conversion
   sensors.py        analytic lidar / radar against that geometry
   traffic_env.py    N vehicles, one world, reward and costs kept apart
@@ -117,10 +118,34 @@ Six generic layouts (`cross`, `tee`, `grid`, `roundabout`, `loop`, `town`)
 also exist for "can it drive at all" testing. `road_network.KINDS` lists all
 fourteen; `road_network.SCENARIO_KINDS` just the eight.
 
+### Every layout is a closed network
+
+The builders produce conflict geometry — a crossroads, a merge, a
+roundabout — not a *place*. Every scenario used to end in four to six arms
+that simply stopped in open ground, which is why the maps did not read as
+complete environments.
+
+`envs/perimeter.py` runs a ring road outside the network's own bounds and
+extends each loose arm along its own direction to meet it. The conflict
+geometry is untouched; the map becomes closed and fully connected, and no
+road terminates in a field. Every scenario now has **zero road dead-ends** —
+only parking bays, which are supposed to be dead ends.
+
+A ring rather than joining arms pairwise: pairwise links would run new roads
+straight across the middle of the layout, often through the junction the
+scenario is about. A ring stays outside everything the builder placed, and
+is also what a real town has.
+
 ### The task is bay to bay, everywhere
 
 Every scenario gets parking bays attached (`envs/bays.py`) and they become
-its sources and goals, so the episode is always "leave a parking space,
+its sources and goals. A bay is a **lay-by** — a pocket alongside the kerb,
+entered and left by a short taper, with the parked vehicle parallel to the
+traffic beside it. Bays used to be perpendicular stubs, which rendered as a
+comb of teeth and is not how on-street parking works; parallel parking is
+also the harder and more interesting manoeuvre.
+
+They so the episode is always "leave a parking space,
 drive the scenario, park in another one". Bays inherit the positions of
 whatever endpoints the scenario declared, so the route still enters the
 merge from the ramp and still crosses the unsignalised junction — it just

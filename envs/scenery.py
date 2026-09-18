@@ -1,40 +1,31 @@
-"""Scenery — buildings and trees placed procedurally from the road graph.
+"""Scenery — buildings and trees along the street, not scattered beside it.
 
-Nothing here is authored per scenario. A layout is a graph of centrelines
-(`road_network.py`) and that graph already says where the road is NOT, so the
-scenery is derived from it: candidates are drawn on a jittered grid over the
-network's bounds and kept or rejected by how far they are from the nearest
-road edge.
+Nothing here is authored per scenario. The road graph already says where the
+roads are and which way they run, so the scenery is derived from it: every
+carriageway gets a **frontage line** on each side, and buildings are set out
+along it facing the street.
 
-    distance from road edge            what goes there
-    --------------------------------   ---------------------------
-    < verge_min                         nothing (kerb, too close)
-    verge_min .. verge_max              trees (street planting)
-    building_setback .. building_max    buildings (block interiors)
-    > building_max                      nothing (open country)
+This replaced a distance-band sampler that dropped buildings anywhere
+between 12 m and 55 m of a road at a random spacing. That produced an even
+scatter of boxes in open ground — the road graph was a diagram with clutter
+around it rather than a place. Buildings in a row, at one setback, square to
+the street they face, is what makes a block read as a block.
 
-Both bands are closed at the top, and the building one being closed is what
-makes the result read as a town rather than as a field of boxes: a built-up
-frontage exists BECAUSE it faces a street, so a candidate 200 m from the
-nearest road is not a building site. It also keeps the object count
-proportional to the network instead of to the square of the map margin.
+    kerb  ->  pavement  ->  front gap  ->  building frontage
+              2.5 m         3.0 m          8-20 m wide, 9-18 m deep
 
-A roundabout's central island is the one place that is neither road nor
-building land — it is off-road by the margin test, sits well inside the
-network, and would otherwise be the most attractive building plot on the
-map. It is excluded explicitly.
+Trees go in the verge between kerb and building line, which is where street
+trees are, and are skipped near junctions so corners stay open — both
+because that is how junctions are built and because a tree on a corner
+blinds the lidar exactly where a policy most needs to see.
 
 Two footprint shapes, and the split is a sensor decision rather than an
-aesthetic one. A tree is a circle: rotationally symmetric, one distance test.
-A building is a rotated rectangle, because a row of buildings along a street
-is a flat wall to a lidar and modelling it as circles would leave the policy
-sight-lines through gaps that do not exist in the picture. Both are what the
-renderer draws AND what the raycast hits, so what the agent sees and what a
-human sees can never drift apart.
-
-Buildings are yawed to the nearest centreline's tangent so they face the
-street they stand on, which costs one `heading_at` call per building and is
-the whole difference between "a town" and "boxes on a lawn".
+aesthetic one. A tree is a circle: rotationally symmetric, one distance
+test. A building is a rotated rectangle, because a row of buildings along a
+street is a flat wall to a lidar and modelling it as circles would leave the
+policy sight-lines through gaps that do not exist in the picture. Both are
+what the renderer draws AND what the raycast hits, so what the agent sees
+and what a human sees can never drift apart.
 """
 
 from __future__ import annotations
@@ -43,29 +34,26 @@ import math
 
 import numpy as np
 
-# Placement bands, in metres from the nearest road EDGE (not centreline).
-VERGE_MIN = 2.5          # kerb clearance: nothing closer than this
-VERGE_MAX = 7.0          # trees live in the strip between the two
-BUILDING_SETBACK = 12.0  # buildings start here, well back off the carriageway
-BUILDING_MAX = 55.0      # and stop here: past this is open country, not a plot
-
-# Candidate grid. Step is the spacing between candidate cells; each candidate
-# is jittered inside its own cell so the result does not read as a lattice.
-TREE_STEP = 11.0
-BUILDING_STEP = 26.0
-JITTER = 0.40            # fraction of a cell, each way
-
-# Sizes. Buildings are drawn from a range rather than fixed so a block is not
-# a row of identical cubes; the ranges are half-extents in metres.
-TREE_RADIUS = (1.0, 2.2)
-TREE_HEIGHT = (4.0, 9.0)
-BUILDING_HALF_L = (6.0, 14.0)
-BUILDING_HALF_W = (5.0, 10.0)
+# The cross-section out from the kerb.
+PAVEMENT = 2.5           # footway, drawn but not an obstacle
+FRONT_GAP = 3.0          # between pavement and the building line
+BUILDING_DEPTH = (9.0, 18.0)    # perpendicular to the street
+BUILDING_FRONTAGE = (8.0, 20.0)  # along it
 BUILDING_HEIGHT = (6.0, 24.0)
+PLOT_GAP = (1.5, 5.0)    # between neighbouring frontages
 
-# Nothing is placed within this distance of a declared source or goal, so a
-# scenario's spawn bay never opens onto a tree trunk.
-ENDPOINT_CLEAR = 8.0
+# Street trees live between kerb and building line.
+TREE_SETBACK = 1.6       # out from the kerb
+TREE_SPACING = (9.0, 15.0)
+TREE_RADIUS = (1.0, 2.0)
+TREE_HEIGHT = (4.0, 9.0)
+
+# Keep clear of junctions and of episode endpoints.
+JUNCTION_CLEAR = 14.0
+ENDPOINT_CLEAR = 9.0
+# Only real carriageways get a frontage; a one-lane bay or aisle does not
+# have buildings fronting onto it.
+MIN_LANES = 2
 
 
 class Scenery:
@@ -93,105 +81,97 @@ class Scenery:
         return cls(np.zeros((0, 6)), np.zeros((0, 4)))
 
 
-def _candidates(bounds, step: float, rng: np.random.Generator) -> np.ndarray:
-    """Jittered grid points covering `bounds` — an (N, 2) array."""
-    x0, y0, x1, y1 = bounds
-    xs = np.arange(x0, x1 + step, step)
-    ys = np.arange(y0, y1 + step, step)
-    gx, gy = np.meshgrid(xs, ys, indexing="ij")
-    pts = np.stack([gx.ravel(), gy.ravel()], axis=1)
-    pts += rng.uniform(-JITTER, JITTER, size=pts.shape) * step
-    return pts
+def _blocked(net, x, y, clearance):
+    """True when a point is on, or within `clearance` of, any road."""
+    return -net.road_margin(float(x), float(y)) < clearance
 
 
-def _clearances(net, pts: np.ndarray) -> np.ndarray:
-    """Distance from each point to the nearest road edge, positive when OFF
-    the road — i.e. `-road_margin`. Looped because `road_margin` walks every
-    piece; this runs once per episode at reset, not per step."""
-    return np.array([-net.road_margin(float(x), float(y)) for x, y in pts])
+def _near_node(net, x, y, extra=0.0):
+    """True near a junction, where nothing should be built."""
+    for (nx, ny), pad in zip(net.nodes, net.node_pads):
+        if math.hypot(x - nx, y - ny) < pad + JUNCTION_CLEAR + extra:
+            return True
+    return False
 
 
-def _endpoint_mask(net, pts: np.ndarray) -> np.ndarray:
-    """True where a point is far enough from every declared source and goal."""
-    ends = [(x, y) for x, y, _ in net.sources] + list(net.goals)
-    if not ends:
-        return np.ones(len(pts), dtype=bool)
-    ends = np.asarray(ends, dtype=float)
-    d = np.hypot(pts[:, None, 0] - ends[None, :, 0],
-                 pts[:, None, 1] - ends[None, :, 1])
-    return d.min(axis=1) > ENDPOINT_CLEAR
+def _near_endpoint(net, x, y):
+    ends = [(x0, y0) for x0, y0, _ in net.sources] + list(net.goals)
+    return any(math.hypot(x - ex, y - ey) < ENDPOINT_CLEAR for ex, ey in ends)
 
 
-def _island_mask(net, pts: np.ndarray, clearance: float = 0.0) -> np.ndarray:
-    """True where a point is outside every roundabout island."""
-    if not net.islands:
-        return np.ones(len(pts), dtype=bool)
-    ok = np.ones(len(pts), dtype=bool)
-    for cx, cy, r in net.islands:
-        ok &= np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) > r + clearance
-    return ok
-
-
-def _no_overlap(placed: list, x: float, y: float, r: float) -> bool:
-    """Reject a candidate whose circumscribed circle touches one already
-    placed. O(n^2) over a few hundred objects at reset — fine."""
+def _fits(placed, x, y, radius):
     for px, py, pr in placed:
-        if math.hypot(x - px, y - py) < r + pr:
+        if math.hypot(x - px, y - py) < radius + pr:
             return False
     return True
 
 
 def generate(net, rng: np.random.Generator, density: float = 1.0,
-             margin: float = 60.0) -> Scenery:
-    """Buildings and trees for one road network.
+             margin: float = 0.0) -> Scenery:
+    """Buildings and street trees for one road network.
 
-    `density` scales how many of the accepted candidates are actually kept
-    (1.0 = all of them, 0.0 = bare network); `margin` is how far past the
-    network's own bounds scenery may spread, which is what stops a layout
-    from ending in a hard edge of empty ground.
+    `density` is the fraction of frontage plots actually built on — 1.0 is a
+    continuous terrace, lower leaves gaps. `margin` is accepted and ignored;
+    frontage placement has no use for it.
     """
     if density <= 0.0:
         return Scenery.empty()
 
-    x0, y0, x1, y1 = net.bounds()
-    bounds = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
     placed: list[tuple[float, float, float]] = []
+    boxes, trees = [], []
 
-    # -- buildings first: they are larger, so they get first refusal on space.
-    boxes = []
-    pts = _candidates(bounds, BUILDING_STEP, rng)
-    clear = _clearances(net, pts)
-    keep = (_endpoint_mask(net, pts) & _island_mask(net, pts, BUILDING_SETBACK)
-            & (clear > BUILDING_SETBACK) & (clear < BUILDING_MAX))
-    pts = pts[keep]
-    for x, y in pts[rng.random(len(pts)) < density]:
-        hl = rng.uniform(*BUILDING_HALF_L)
-        hw = rng.uniform(*BUILDING_HALF_W)
-        r = math.hypot(hl, hw)
-        if not _no_overlap(placed, x, y, r):
+    for index, piece in enumerate(net.pieces):
+        if piece.lanes < MIN_LANES or piece.length < 2 * JUNCTION_CLEAR:
             continue
-        # A building's own footprint must clear the road too, not just its
-        # centre: a 14 m-long block dropped 12 m off the kerb would otherwise
-        # have one corner standing in the outside lane.
-        if -net.road_margin(float(x), float(y)) < r + VERGE_MIN:
-            continue
-        placed.append((float(x), float(y), r))
-        boxes.append((x, y, hl, hw, net.heading_at(float(x), float(y)),
-                      rng.uniform(*BUILDING_HEIGHT)))
 
-    # -- trees: the verge strip, plus whatever gaps the buildings left.
-    trees = []
-    pts = _candidates(bounds, TREE_STEP, rng)
-    clear = _clearances(net, pts)
-    keep = (_endpoint_mask(net, pts) & _island_mask(net, pts, VERGE_MIN)
-            & (clear > VERGE_MIN) & (clear < VERGE_MAX))
-    pts = pts[keep]
-    for x, y in pts[rng.random(len(pts)) < density]:
-        r = rng.uniform(*TREE_RADIUS)
-        if not _no_overlap(placed, x, y, r):
-            continue
-        placed.append((float(x), float(y), r))
-        trees.append((x, y, r, rng.uniform(*TREE_HEIGHT)))
+        for sign in (1.0, -1.0):
+            # -- buildings, stepping along the frontage ------------------
+            s = JUNCTION_CLEAR
+            while s < piece.length - JUNCTION_CLEAR:
+                frontage = float(rng.uniform(*BUILDING_FRONTAGE))
+                depth = float(rng.uniform(*BUILDING_DEPTH))
+                s += frontage / 2.0
+                if s > piece.length - JUNCTION_CLEAR:
+                    break
+
+                cx, cy = piece.point(s)
+                tx, ty = piece.tangent(s)
+                nx, ny = ty * sign, -tx * sign
+                out = piece.half_width + PAVEMENT + FRONT_GAP + depth / 2.0
+                bx, by = cx + nx * out, cy + ny * out
+                radius = math.hypot(frontage, depth) / 2.0
+
+                ok = (rng.random() < density
+                      and not _near_node(net, bx, by)
+                      and not _near_endpoint(net, bx, by)
+                      and not _blocked(net, bx, by, radius + 1.0)
+                      and _fits(placed, bx, by, radius))
+                if ok:
+                    placed.append((bx, by, radius))
+                    boxes.append((bx, by, frontage / 2.0, depth / 2.0,
+                                  math.atan2(ty, tx),
+                                  float(rng.uniform(*BUILDING_HEIGHT))))
+                s += frontage / 2.0 + float(rng.uniform(*PLOT_GAP))
+
+            # -- street trees in the verge -------------------------------
+            s = JUNCTION_CLEAR
+            while s < piece.length - JUNCTION_CLEAR:
+                cx, cy = piece.point(s)
+                tx, ty = piece.tangent(s)
+                nx, ny = ty * sign, -tx * sign
+                radius = float(rng.uniform(*TREE_RADIUS))
+                out = piece.half_width + PAVEMENT + TREE_SETBACK
+                px, py = cx + nx * out, cy + ny * out
+
+                if (rng.random() < density
+                        and not _near_node(net, px, py)
+                        and not _near_endpoint(net, px, py)
+                        and not _blocked(net, px, py, radius + 0.5)
+                        and _fits(placed, px, py, radius)):
+                    placed.append((px, py, radius))
+                    trees.append((px, py, radius,
+                                  float(rng.uniform(*TREE_HEIGHT))))
+                s += float(rng.uniform(*TREE_SPACING))
 
     return Scenery(np.array(boxes or np.zeros((0, 6))),
                    np.array(trees or np.zeros((0, 4))))

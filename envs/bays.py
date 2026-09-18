@@ -22,14 +22,25 @@ exercises.
 Extra bays are then scattered along the network for the other 18-28 vehicles,
 because a scenario declares two endpoints and the traffic needs twenty.
 
-## What attaching one costs
+## A bay is a lay-by, not a stub
 
-A bay is a one-lane stub running perpendicular out of the carriageway, so
-the road it leaves has to gain a junction node where the stub meets it. That
-means **splitting a piece** — the stub's node has to be a real node of the
-graph or nothing can route through it. Only straight pieces are split:
-splitting an arc means recovering its centre and sweep for both halves, and
-nobody parks on a roundabout ring.
+Bays used to be one-lane stubs running perpendicular out of the
+carriageway. Twenty-two of those down a street render as a comb of teeth,
+and they are not how on-street parking works anywhere.
+
+A bay is now a **lay-by**: a pocket alongside the kerb, parallel to the
+road, entered by a short taper and left by another. Three pieces —
+taper in, the bay itself, taper out — with the bay parallel to the traffic
+it sits beside, so a vehicle parked in one is oriented the way a parked car
+actually is.
+
+That also makes the manoeuvre the right one. Reversing into a perpendicular
+stub is a different (and easier) problem from parallel parking, which needs
+the vehicle to judge a gap alongside moving traffic.
+
+The road gains two junction nodes per bay, so a piece is **split twice**.
+Only straight pieces are split: splitting an arc means recovering its
+centre and sweep for both halves, and nobody parks on a roundabout ring.
 """
 
 from __future__ import annotations
@@ -40,20 +51,23 @@ import numpy as np
 
 from envs.road_network import RoadNetwork, _Straight
 
-BAY_DEPTH = 5.5          # how far the bay sticks out past the road edge
 BAY_LANES = 1            # a bay is one lane wide, by definition
+BAY_LENGTH = 7.0         # the parking space itself, along the kerb
+BAY_TAPER = 4.0          # the angled entry and exit at each end
 MIN_SPLIT_GAP = 8.0      # never split a piece within this of either end
-EXTRA_BAYS = 18          # beyond the ones inheriting a declared endpoint
+EXTRA_BAYS = 12          # beyond the ones inheriting a declared endpoint
 # Centre-to-centre spacing between two bays' entrances. A bay is one lane
 # wide, so anything under about a lane and a half puts two parked cars in
 # the same space — and `_nearest_straight` clamps a candidate away from a
 # piece's ends, which makes every random point near an end land on the SAME
 # split position unless something rejects it.
-BAY_SPACING = 7.5
+# A lay-by consumes BAY_LENGTH + 2 * BAY_TAPER of kerb, so two of them any
+# closer than that would share tarmac.
+BAY_SPACING = BAY_LENGTH + 2 * BAY_TAPER + 6.0
 
 
 def attach(net: RoadNetwork, rng: np.random.Generator,
-           extra: int = EXTRA_BAYS, depth: float = BAY_DEPTH) -> RoadNetwork:
+           extra: int = EXTRA_BAYS) -> RoadNetwork:
     """Add bays to `net` and make them its sources and goals.
 
     Returns the same network, re-finalised. Call before generating scenery,
@@ -65,7 +79,7 @@ def attach(net: RoadNetwork, rng: np.random.Generator,
     bays: list[tuple[float, float, float]] = []      # x, y, heading_deg
     entrances: list[tuple[float, float]] = []        # where each meets the road
     for x, y in targets:
-        bay = _attach_one(net, x, y, depth, entrances)
+        bay = _attach_one(net, x, y, entrances)
         if bay is not None:
             bays.append(bay)
 
@@ -75,7 +89,7 @@ def attach(net: RoadNetwork, rng: np.random.Generator,
     while len(bays) - len(targets) < extra and attempts < extra * 8:
         attempts += 1
         x, y, _h = net.sample_pose(rng, lane_bias=False)
-        bay = _attach_one(net, x, y, depth, entrances)
+        bay = _attach_one(net, x, y, entrances)
         if bay is not None:
             bays.append(bay)
 
@@ -96,13 +110,12 @@ def attach(net: RoadNetwork, rng: np.random.Generator,
     return net.finalize()
 
 
-def _attach_one(net: RoadNetwork, x: float, y: float, depth: float,
-                entrances: list):
-    """Split the straight nearest (x, y) and run a bay out of it.
+def _attach_one(net: RoadNetwork, x: float, y: float, entrances: list):
+    """Cut a lay-by into the kerb nearest (x, y).
 
-    Returns the bay's pose `(x, y, heading_deg)` facing OUT toward the road,
-    or None when there is nowhere here to put one. `entrances` is the list of
-    road-side points of the bays placed so far, and is appended to on
+    Returns the bay's pose `(x, y, heading_deg)`, parallel to the road, or
+    None when there is nowhere here to put one. `entrances` holds the
+    road-side midpoints of the bays placed so far and is appended to on
     success.
     """
     piece_index, s = _nearest_straight(net, x, y)
@@ -110,31 +123,59 @@ def _attach_one(net: RoadNetwork, x: float, y: float, depth: float,
         return None
 
     piece = net.pieces[piece_index]
-    px, py = piece.point(s)
-    if any(math.hypot(px - ex, py - ey) < BAY_SPACING for ex, ey in entrances):
+    half = BAY_LENGTH / 2.0 + BAY_TAPER
+    if s - half < MIN_SPLIT_GAP or s + half > piece.length - MIN_SPLIT_GAP:
+        return None
+
+    mx, my = piece.point(s)
+    if any(math.hypot(mx - ex, my - ey) < BAY_SPACING for ex, ey in entrances):
         return None
     tx, ty = piece.tangent(s)
+    offset = piece.half_width + BAY_LANES * net.lane_width / 2.0
 
-    # Try both sides; take the first whose far end is clear of every road.
-    # A bay driven out into the middle of a parallel street would be
-    # drivable, connected, and wrong.
-    reach = piece.half_width + depth
     for sign in (1.0, -1.0):
-        nx, ny = ty * sign, -tx * sign               # right of travel, then left
-        ex, ey = px + nx * reach, py + ny * reach
-        if net.road_margin(ex, ey) > -BAY_LANES * net.lane_width:
+        nx, ny = ty * sign, -tx * sign          # kerb side: right, then left
+        # The four corners of the lay-by: two taper feet on the centreline,
+        # two bay ends offset out to the kerb.
+        foot_a = piece.point(s - half)
+        foot_b = piece.point(s + half)
+        end_a = (mx - tx * BAY_LENGTH / 2.0 + nx * offset,
+                 my - ty * BAY_LENGTH / 2.0 + ny * offset)
+        end_b = (mx + tx * BAY_LENGTH / 2.0 + nx * offset,
+                 my + ty * BAY_LENGTH / 2.0 + ny * offset)
+
+        # Both ends must be clear of every other road, or the lay-by is cut
+        # into the middle of a parallel street.
+        clearance = -BAY_LANES * net.lane_width / 2.0
+        if (net.road_margin(*end_a) > clearance
+                or net.road_margin(*end_b) > clearance):
             continue
 
-        node = _split(net, piece_index, s)
-        if node is None:
+        node_a = _split_at_point(net, foot_a)
+        node_b = _split_at_point(net, foot_b)
+        if node_a is None or node_b is None:
             return None
-        end = net.add_node(ex, ey, "end")
-        net.add_straight(node, end, BAY_LANES)
-        entrances.append((px, py))
-        # Facing out of the bay is facing back toward the road, i.e. along
-        # -(nx, ny). H is the Panda angle road_network stores headings in.
-        return (ex, ey, math.degrees(math.atan2(nx, -ny)))
+
+        bay_a = net.add_node(*end_a, kind="end")
+        bay_b = net.add_node(*end_b, kind="end")
+        net.add_straight(node_a, bay_a, BAY_LANES)   # taper in
+        net.add_straight(bay_a, bay_b, BAY_LANES)    # the space itself
+        net.add_straight(bay_b, node_b, BAY_LANES)   # taper out
+        entrances.append((mx, my))
+
+        # Parked parallel to the traffic beside it, facing the way the
+        # taper-out leads, so pulling away is a forward move.
+        centre = ((end_a[0] + end_b[0]) / 2.0, (end_a[1] + end_b[1]) / 2.0)
+        return (centre[0], centre[1], math.degrees(math.atan2(-tx, ty)))
     return None
+
+
+def _split_at_point(net: RoadNetwork, point):
+    """Split whichever straight passes through `point`, returning the node."""
+    index, s = _nearest_straight(net, point[0], point[1], gap=2.0)
+    if index is None:
+        return None
+    return _split(net, index, s, gap=2.0)
 
 
 def _nearest_straight(net: RoadNetwork, x: float, y: float,

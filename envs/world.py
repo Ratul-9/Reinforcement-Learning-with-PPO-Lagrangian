@@ -99,6 +99,17 @@ class World:
         if jitter > 0.0:
             spec = cls.jitter_spec(spec, rng, jitter)
         net = road_network.build(spec)
+        # Close the map before anything else touches it. A bay is a
+        # legitimate dead end, so the ring pass has to run while the only
+        # dead ends present are the ones the builder left dangling.
+        #
+        # parking_lot is included: its thirty-seven dead ends are one-lane
+        # bays, which the ring pass filters out by width, leaving only its
+        # dangling three-lane access road to be joined — which is exactly a
+        # car park served by a road, and gives its frontage something to
+        # face.
+        from envs import perimeter
+        net = perimeter.close_network(net)
         if bays and net.spec.get("kind") != "parking_lot":
             from envs import bays as bays_mod
             net = bays_mod.attach(net, rng)
