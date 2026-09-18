@@ -373,8 +373,13 @@ class TrafficEnv(gym.Env):
         for i in order[:n_now]:
             self._arrive(int(i))
 
-        return self._observations(), {"cost": self._zero_costs(),
-                                      "active": self._active.copy()}
+        # The same keys `step` returns, not a subset. A caller that has to
+        # branch on whether this is the first info of the episode will get
+        # it wrong exactly once, at the boundary, which is the hardest place
+        # to notice it.
+        return self._observations(), self._info(
+            self._zero_costs(), [""] * self.n_agents,
+            np.full(self.n_agents, np.inf))
 
     def _park(self, i: int) -> None:
         """Take agent `i` off the road until its next arrival."""
@@ -617,12 +622,7 @@ class TrafficEnv(gym.Env):
         truncated = self._active & (self._age >= self.max_steps)
 
         obs = self._observations()
-        info = {"cost": costs, "events": events, "active": self._active.copy(),
-                "route": self._route_prev.copy(),
-                "vehicle_type": list(self.vehicle_types),
-                "budget": self._budget_obs.copy(),
-                "ttc": ttc_raw,
-                "scenario": self.world.spec.get("kind", "?")}
+        info = self._info(costs, events, ttc_raw)
 
         # Retire whatever finished. Done AFTER the observation is taken: the
         # learner's last observation of an episode must be the state the
@@ -642,6 +642,18 @@ class TrafficEnv(gym.Env):
                 self._arrive(int(i))
 
         return obs, list(rewards), list(terminated), list(truncated), info
+
+    def _info(self, costs: dict, events: list, ttc_raw: np.ndarray) -> dict:
+        """The info dict, built in one place so `reset` and `step` cannot
+        drift apart. See Handoff.md for what each key means."""
+        return {"cost": costs,
+                "events": list(events),
+                "active": self._active.copy(),
+                "route": self._route_prev.copy(),
+                "ttc": np.asarray(ttc_raw, dtype=np.float64),
+                "budget": self._budget_obs.copy(),
+                "vehicle_type": list(self.vehicle_types),
+                "scenario": self.world.spec.get("kind", "?")}
 
     def _zero_costs(self) -> dict:
         return {k: np.zeros(self.n_agents, dtype=np.float32)

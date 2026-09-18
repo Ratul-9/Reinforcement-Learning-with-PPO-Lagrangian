@@ -551,6 +551,57 @@ def test_blockages_are_on_the_road_and_seen():
     assert ranges.min() < 25.0, "lidar cannot see a stalled vehicle 20 m ahead"
 
 
+def test_contract_is_stable():
+    """Pin the interface Handoff.md documents.
+
+    The trainer is written by someone else against that document. A shape
+    or a key that changes without this failing is a silent break in another
+    person's code, discovered as a confusing loss curve rather than as an
+    error.
+    """
+    env = TrafficEnv("manhattan", n_agents=6, seed=0)
+
+    obs_shapes = {"state": (10,), "navigation": (6,), "lidar": (120,),
+                  "radar": (5, 4), "vehicle": (8,), "budget": (7,)}
+    info_keys = {"cost", "active", "events", "budget", "ttc", "route",
+                 "vehicle_type", "scenario"}
+
+    obs, info = env.reset()
+    # reset and step must agree: a caller that has to branch on which one
+    # produced an info gets it wrong exactly once, at the episode boundary.
+    assert set(info) == info_keys, sorted(info)
+
+    obs, reward, terminated, truncated, info = env.step(
+        [env.action_space.sample() for _ in range(6)])
+
+    assert set(info) == info_keys, sorted(info)
+    assert set(obs[0]) == set(obs_shapes), sorted(obs[0])
+    for key, shape in obs_shapes.items():
+        assert obs[0][key].shape == shape, (key, obs[0][key].shape)
+        assert obs[0][key].dtype == np.float32, (key, obs[0][key].dtype)
+
+    assert len(reward) == len(terminated) == len(truncated) == 6
+    assert set(info["cost"]) == set(COST_CHANNELS)
+    for channel in COST_CHANNELS:
+        assert info["cost"][channel].shape == (6,)
+    assert info["active"].dtype == bool and info["active"].shape == (6,)
+    assert info["budget"].shape == (6, len(COST_CHANNELS))
+    assert info["ttc"].shape == (6,)
+    assert len(info["events"]) == 6 and len(info["vehicle_type"]) == 6
+    assert isinstance(info["scenario"], str)
+
+    # The budget in the observation must be the same vector as the one in
+    # info, or a policy conditioned on one and a dual update using the other
+    # are enforcing different constraints.
+    live = int(np.flatnonzero(info["active"])[0])
+    assert np.allclose(obs[live]["budget"], info["budget"][live])
+
+    # And it must match the budget table for that agent's own vehicle type.
+    from envs.budgets import as_vector
+    assert np.allclose(info["budget"][live],
+                       as_vector(info["vehicle_type"][live]))
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be

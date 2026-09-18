@@ -35,6 +35,9 @@ envs/budgets.py     per-type cost budgets — the d_i in the Lagrangian
 
 `vehicle.Vehicle` supplies the physics; nothing in `envs/` duplicates it.
 
+**Writing the trainer? Read [`Handoff.md`](Handoff.md)** — it is the
+env/learner contract, pinned by a test so it cannot drift silently.
+
 ---
 
 ## Quick start
@@ -81,7 +84,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 29 checks, run after any change
+python test_envs.py                        # 30 checks, run after any change
 python fleet.py                            # the vehicle table
 python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
