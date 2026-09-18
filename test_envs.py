@@ -341,6 +341,37 @@ def test_all_on_mode_disables_staggering():
     assert info["active"].all(), "initial_active=1.0 left someone waiting"
 
 
+def test_route_waypoints_are_in_lane():
+    """A route waypoint must sit in the lane the route runs in, not on the
+    centreline between two of them.
+
+    A vehicle steering at a centreline waypoint drives down the middle of
+    the carriageway, which on a two-way road is the oncoming lane. That is
+    not cosmetic: it made `wrong_way` fire on a third of all steps by
+    construction, before the policy had done anything wrong, and a
+    constraint violated that often at initialisation is what drives plain
+    dual ascent into oscillation.
+    """
+    world = bare("manhattan")
+    rng = np.random.default_rng(0)
+    x, y, _h = world.sample_start(rng, declared=False)
+    gx, gy, _route = world.sample_goal(rng, (x, y), 80.0)
+
+    lookaheads = (8.0, 18.0, 30.0)
+    centre, _ = world.route_probe((x, y), (gx, gy), lookaheads)
+    inlane, _ = world.lane_waypoints((x, y), (gx, gy), lookaheads)
+
+    moved = 0
+    for (cx, cy), (lx, ly) in zip(centre, inlane):
+        i, s, _lat, _d = world.net.project(cx, cy)
+        if len(world.lanes.lanes(i)) < 2:
+            continue                      # a one-lane bay has no lane to pick
+        assert math.hypot(lx - cx, ly - cy) > 0.5, "waypoint stayed on the centreline"
+        assert world.net.is_on_road(lx, ly), "waypoint was shifted off the road"
+        moved += 1
+    assert moved, "no multi-lane waypoint on this route to check"
+
+
 def test_costs_are_bounded():
     """Every channel must stay in [0, 1] per step, under any behaviour.
 

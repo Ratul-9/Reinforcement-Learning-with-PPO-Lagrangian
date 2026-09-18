@@ -217,7 +217,59 @@ class World:
         return self.net.road_state(float(x), float(y))
 
     def route_probe(self, a_xy, b_xy, lookaheads):
+        """Raw route waypoints — points on the road's CENTRELINE."""
         return self.net.route_probe(a_xy, b_xy, lookaheads)
+
+    def lane_waypoints(self, a_xy, b_xy, lookaheads):
+        """Route waypoints shifted into the lane the route runs in.
+
+        `RoadNetwork.route_probe` answers with centreline points, because a
+        centreline graph is all it has. A vehicle that steers straight at one
+        drives down the middle of the carriageway — which on a two-way road
+        is the ONCOMING lane half the time.
+
+        That is not merely untidy. It means `wrong_way` fires on 20-40% of
+        steps by construction, before the policy has done anything wrong, and
+        a constraint violated a third of the time at initialisation drives
+        its multiplier up hard — the dual-ascent collapse the method has to
+        design around. Shifting the waypoint into its lane makes wrong_way a
+        real violation rather than the default state, and leaves `lane_keep`
+        to bind where it should: cornering, overtaking, avoiding a conflict.
+
+        The direction of travel at each waypoint is taken from the route
+        itself — the step from the previous point to this one — rather than
+        from the vehicle's heading, so the shift is still correct on the far
+        side of a junction the vehicle has not reached yet.
+        """
+        points, remaining = self.net.route_probe(a_xy, b_xy, lookaheads)
+        out = []
+        previous = (float(a_xy[0]), float(a_xy[1]))
+        # Sorted, so each waypoint's incoming direction is measured from the
+        # one before it along the route rather than from whatever order the
+        # caller happened to ask in.
+        order = sorted(range(len(points)), key=lambda k: lookaheads[k])
+        shifted = list(points)
+        for k in order:
+            shifted[k] = self._to_lane(previous, points[k])
+            previous = points[k]
+        out = shifted
+        return out, remaining
+
+    def _to_lane(self, came_from, point):
+        """One centreline point, moved into the lane a vehicle traveling
+        `came_from -> point` belongs in."""
+        i, s, _lateral, _d = self.net.project(point[0], point[1])
+        piece = self.net.pieces[i]
+        tx, ty = piece.tangent(s)
+        dx = point[0] - came_from[0]
+        dy = point[1] - came_from[1]
+        if math.hypot(dx, dy) < 1e-6:
+            return point
+        forward = (dx * tx + dy * ty) >= 0.0
+        lane = self.lanes.lane_for_travel(i, forward)
+        # Offsets are LEFT-positive relative to the PIECE's tangent, which is
+        # not the direction of travel on a lane running against it.
+        return (point[0] - ty * lane.offset, point[1] + tx * lane.offset)
 
     def locate_lane(self, x: float, y: float, heading: float):
         """Which lane this pose is in and whether it faces the right way."""

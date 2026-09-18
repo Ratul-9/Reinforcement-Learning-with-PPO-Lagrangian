@@ -543,7 +543,9 @@ class TrafficEnv(gym.Env):
                 continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
             goal = tuple(self._goals[i])
-            (near, far), route = self.world.route_probe(
+            # Lane-aware, not centreline: steering straight at a centreline
+            # waypoint is steering into the oncoming lane on a two-way road.
+            (near, far), route = self.world.lane_waypoints(
                 (veh.x, veh.y), goal, (LOOKAHEAD_NEAR, LOOKAHEAD_FAR))
 
             # Other vehicles are obstacles to the lidar exactly as buildings

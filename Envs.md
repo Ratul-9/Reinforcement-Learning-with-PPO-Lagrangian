@@ -74,7 +74,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 22 checks, run after any change
+python test_envs.py                        # 23 checks, run after any change
 python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
@@ -358,24 +358,39 @@ worth more than tidying its heading convention.
 
 ---
 
-## Route waypoints are on the centreline, not in a lane
+## Route waypoints are lane-aware
 
-`route_probe` returns points on the road's **centreline**, so a controller
-that tracks the waypoint perfectly drives down the middle of the
-carriageway — and on a two-way road that is the wrong lane half the time.
-`rollout.py`'s pure-pursuit driver shows it plainly: 0.19–0.37 wrong-way
-cost per agent-step, almost all of it from exactly this.
+`RoadNetwork.route_probe` answers with points on the road's **centreline**,
+because a centreline graph is all it has. `World.lane_waypoints` shifts each
+one into the lane the route actually runs in, and that is what the
+observation carries.
 
-This is a live design decision, not a bug:
+This was a deliberate change, not a tidy-up. Steering at a centreline
+waypoint means driving down the middle of the carriageway, which on a
+two-way road is the oncoming lane — so `wrong_way` fired on a third of all
+steps *by construction*, before any policy had done anything wrong. A
+constraint violated that often at initialisation drives its multiplier hard
+and is precisely the dual-ascent collapse the method has to design around.
 
-- **Leave it.** The policy sees `lane_offset` and `wrong_way` in its
-  observation and the two lane costs in its budget, so it can learn the
-  offset itself. Harder problem, more honest one.
-- **Offset the waypoints into the correct lane.** Makes lane keeping nearly
-  free and removes most of what `lane_keep` was there to measure.
+Direction of travel at each waypoint comes from the route itself (the step
+from the previous waypoint), not from the vehicle's heading, so the shift is
+still right on the far side of a junction the vehicle has not reached.
 
-Whichever is chosen should be chosen deliberately, because it changes what
-the lane constraints are worth as a result.
+Measured with the scripted driver, per active agent-step:
+
+| | centreline | in-lane |
+|---|---|---|
+| goals (all 8 scenarios) | 101 | **157** |
+| crashes | 781 | **574** |
+| `wrong_way` | 0.18–0.39 | **0.13–0.30** |
+| `lane_keep` | 0.29–0.54 | **0.21–0.38** |
+| `collision` | 0.005–0.015 | **0.003–0.012** |
+| `offroad` | 0.04–0.11 | 0.07–0.09 |
+
+`offroad` went slightly **up**, and that is the honest trade: a vehicle
+correctly in its lane sits nearer the kerb than one straddling the middle.
+`lane_keep` still binds where it should — cornering, overtaking, avoiding a
+conflict — so it keeps its dial.
 
 ---
 
