@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *_3d.png
 *_map.png
+figures/
