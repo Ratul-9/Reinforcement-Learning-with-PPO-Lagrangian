@@ -280,6 +280,9 @@ class RoadNetwork:
         self._next: np.ndarray = np.zeros((0, 0), dtype=int)
         self._link: dict[tuple[int, int], int] = {}
         self._cum_len: np.ndarray = np.zeros(0)
+        # Broad-phase index for `_project_full`; built in `finalize`.
+        self._bb: np.ndarray = np.zeros((0, 4))
+        self._bb_hw: np.ndarray = np.zeros(0)
 
     # -- construction -----------------------------------------------------
 
@@ -379,6 +382,7 @@ class RoadNetwork:
         self._next = nxt
         lengths = np.array([p.length for p in self.pieces], dtype=float)
         self._cum_len = np.cumsum(lengths) if len(lengths) else np.zeros(0)
+        self._build_index()
         return self
 
     # -- basic geometry ---------------------------------------------------
@@ -412,6 +416,39 @@ class RoadNetwork:
         `half_width` for the distance to the road's edge."""
         return self._project_full(x, y)[:4]
 
+    def _build_index(self) -> None:
+        """Bounding box per piece, for the broad phase in `_project_full`.
+
+        `_project_full` is the single hottest call in a training run — a
+        profile of one step of twenty agents shows it walking every piece of
+        the network six times per agent, which on a network with bays is
+        over a million `closest` calls per 150 steps. The boxes let almost
+        all of those be skipped without changing the answer.
+
+        Padded by the arc sampling sagitta, because a piece's cached
+        polyline is a chord approximation that sits INSIDE the true arc:
+        an unpadded box could exclude the very piece the point is nearest.
+        """
+        if not self.pieces:
+            self._bb = np.zeros((0, 4))
+            self._bb_hw = np.zeros(0)
+            return
+        pad = []
+        boxes = []
+        for piece in self.pieces:
+            poly = piece._poly if len(piece._poly) else np.array(
+                [piece.point(0.0), piece.point(piece.length)])
+            boxes.append([poly[:, 0].min(), poly[:, 1].min(),
+                          poly[:, 0].max(), poly[:, 1].max()])
+            if isinstance(piece, _Arc):
+                half = math.radians(_ARC_STEP_DEG) / 2.0
+                pad.append(piece.r * (1.0 - math.cos(half)))
+            else:
+                pad.append(0.0)
+        pad = np.asarray(pad)[:, None]
+        self._bb = np.asarray(boxes, dtype=float) + np.hstack([-pad, -pad, pad, pad])
+        self._bb_hw = np.array([p.half_width for p in self.pieces], dtype=float)
+
     def _project_full(self, x: float, y: float):
         """(piece index, s, signed lateral, distance, margin), where the piece
         chosen is the one whose EDGE is nearest — not whose centreline is.
@@ -423,13 +460,31 @@ class RoadNetwork:
         "off road" for a vehicle sitting squarely on the arterial. Ranking by
         margin asks the question the callers actually mean — which road am I
         on — and reduces to the old behaviour when every piece is the same
-        width."""
+        width.
+
+        Broad phase first. The distance from the point to a piece's bounding
+        box is a LOWER bound on its distance to that piece, so
+        `half_width - box_distance` is an UPPER bound on the margin the piece
+        could offer. Visiting pieces in descending order of that bound and
+        stopping once it falls below the best margin actually measured is
+        exact — it cannot skip a piece that would have won — while
+        evaluating a handful of pieces instead of all of them.
+        """
         best = (0, 0.0, 0.0, float("inf"), -float("inf"))
-        for i, piece in enumerate(self.pieces):
-            s, lateral, d = piece.closest(x, y)
-            margin = piece.half_width - d
+        if self._bb.shape[0] != len(self.pieces):
+            self._build_index()
+
+        dx = np.maximum(self._bb[:, 0] - x, 0.0) + np.maximum(x - self._bb[:, 2], 0.0)
+        dy = np.maximum(self._bb[:, 1] - y, 0.0) + np.maximum(y - self._bb[:, 3], 0.0)
+        bound = self._bb_hw - np.hypot(dx, dy)
+
+        for i in np.argsort(-bound):
+            if bound[i] <= best[4]:
+                break
+            s, lateral, d = self.pieces[i].closest(x, y)
+            margin = self.pieces[i].half_width - d
             if margin > best[4]:
-                best = (i, s, lateral, d, margin)
+                best = (int(i), s, lateral, d, margin)
         return best
 
     def is_on_road(self, x: float, y: float) -> bool:

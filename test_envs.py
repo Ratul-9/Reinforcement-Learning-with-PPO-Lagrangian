@@ -15,7 +15,7 @@ import numpy as np
 
 from envs import road_network, sensors
 from envs.world import World, h_to_rad, rad_to_h
-from envs.traffic_env import TrafficEnv
+from envs.traffic_env import TrafficEnv, COST_CHANNELS
 from vehicle import Gear
 
 
@@ -381,8 +381,6 @@ def test_costs_are_bounded():
     from the others. An unbounded channel silently reintroduces exactly the
     arbitrary weighting the method exists to remove.
     """
-    from envs.traffic_env import COST_CHANNELS
-
     env = TrafficEnv("manhattan", n_agents=12, seed=3, **ALL_ON)
     obs, _ = env.reset()
     peak = {k: 0.0 for k in COST_CHANNELS}
@@ -412,6 +410,42 @@ def test_jerk_ignores_control_rate():
         _, _, _, _, info = env.step([drive(throttle=0.35)])
         steady = max(steady, float(info["cost"]["jerk"][0]))
     assert steady < 0.5, f"steady acceleration charged as jerk: {steady}"
+
+
+def test_vec_env_runs_mixed_scenarios():
+    """Workers must run different scenarios at once and hand back batched
+    observations — that is what lets a shared policy see a roundabout and a
+    merge in the same update instead of overfitting one layout per run."""
+    from envs.vec import VecTrafficEnv, performance_cores
+
+    assert performance_cores() >= 1
+
+    with VecTrafficEnv(["manhattan", "merge_ramp"], n_agents=6, seed=0) as vec:
+        obs = vec.reset()
+        assert len(obs) == 2
+        assert obs[0]["lidar"].shape == (6, 120), obs[0]["lidar"].shape
+        assert obs[0]["state"].shape == (6, 10)
+
+        actions = [[vec.action_space.sample() for _ in range(6)]
+                   for _ in range(2)]
+        obs, rew, term, trunc, info = vec.step(actions)
+        assert len(rew) == 2 and len(rew[0]) == 6
+        assert set(info[0]["cost"]) == set(COST_CHANNELS)
+        assert info[0]["active"].shape == (6,)
+
+
+def test_batch_obs_round_trips():
+    """`batch_obs` must stack a single env's observations into the same
+    shape the vectorised wrapper sends, so both paths feed a policy the same
+    thing."""
+    from envs.traffic_env import batch_obs
+
+    env = TrafficEnv("cross", n_agents=4, seed=0, world=bare(), **ALL_ON)
+    obs, _ = env.reset()
+    batched = batch_obs(obs)
+    assert batched["lidar"].shape == (4, 120)
+    assert batched["radar"].shape == (4, 5, 4)
+    assert np.array_equal(batched["state"][2], obs[2]["state"])
 
 
 def test_png_round_trip():

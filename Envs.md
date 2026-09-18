@@ -74,7 +74,8 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 23 checks, run after any change
+python test_envs.py                        # 25 checks, run after any change
+python -m envs.vec                         # parallel throughput benchmark
 python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
@@ -235,11 +236,65 @@ a depth buffer read back off a GPU. At 20–30 agents × 20 Hz that is the
 difference between a run that fits on a laptop and one that does not, and
 the answers are exact rather than quantised to a framebuffer.
 
-Measured: **~1000–1500 agent-steps/s** on one CPU core, all eight scenarios.
+Measured: **~2300–2500 agent-steps/s** on one CPU core, all eight scenarios.
+Two exact optimisations got it there from ~1150, neither changing an answer:
+
+- **Broad-phase road projection.** `_project_full` was the hottest call in
+  the run — twenty agents projecting six times each per step, against every
+  piece of the network. A per-piece bounding box gives a lower bound on the
+  distance, hence an upper bound on the margin; visiting pieces in
+  descending order of that bound and stopping once it falls below the best
+  margin measured is exact and evaluates a handful instead of all sixty.
+  Verified against brute force on 3000 random points: 0 mismatches.
+- **Range-pruned lidar.** An object whose centre is beyond `max_range` plus
+  its own circumradius cannot be hit, so it never enters the O(rays ×
+  objects) raycast.
 
 Because both renderers and the sensors read the *same* arrays, a pixel
 observation added later cannot describe a different world from the one the
 lidar reported.
+
+---
+
+## Running many environments at once
+
+`envs/vec.py` runs one `TrafficEnv` per worker process, optionally each on a
+different scenario — which is what a curriculum wants, since a shared policy
+then sees a roundabout, a merge and a parking lot in the same update.
+
+```python
+from envs.vec import VecTrafficEnv, performance_cores
+
+with VecTrafficEnv(["manhattan", "merge_ramp", "roundabout_yield"],
+                   n_agents=20) as vec:
+    obs = vec.reset()                    # per env, BATCHED: (n_agents, 120) lidar
+    obs, rew, term, trunc, info = vec.step(actions)
+```
+
+A worker owns a whole env rather than a slice of one: agents inside an env
+collide with each other and appear in each other's lidar, so splitting there
+would mean shipping every pose to every worker each step.
+
+**Use one worker per *performance* core.** `os.cpu_count()` counts efficiency
+cores, which are several times slower at this workload, and the parent waits
+for every worker each step — so the slowest one sets the pace.
+`performance_cores()` reads the real number.
+
+Measured on an Apple M4 (4 performance + 6 efficiency), 20 agents each:
+
+| workers | wall | per-worker busy | agent-steps/s |
+|---|---|---|---|
+| 1 | 0.95 s | 0.93 s | 3161 |
+| 4 | 2.35 s | 1.96 s | **5114** |
+| 8 | 5.12 s | 3.46 s | 4683 |
+
+What grows is the per-worker *compute*, not the plumbing: identical work
+takes 2.1× longer at four workers and 3.7× at eight, because past the
+fourth it lands on an efficiency core. The pipe itself sustains ~4600
+round-trips/s — a ceiling of ~90k agent-steps/s at 20 agents, two orders of
+magnitude clear of anything measured. **So the plateau is this laptop, not
+the design**; coordination efficiency is 0.84, and a box with 16 real
+performance cores should scale close to linearly.
 
 ---
 
@@ -351,10 +406,13 @@ speaks that engine's **H angle** — degrees, zero along +Y. `vehicle.Sedan`
 speaks the ordinary maths convention — **radians, zero along +X**. Every
 crossing goes through `world.h_to_rad` / `world.rad_to_h` and nowhere else.
 
-The port is byte-identical to `LANCER3D-dev/sim/world/road_network.py` on
-purpose: it is pure numpy geometry with no Panda3D or Qt import, it is the
-most load-bearing file here, and keeping it diffable against its origin is
-worth more than tidying its heading convention.
+`road_network.py` began as a byte-identical port of
+`LANCER3D-dev/sim/world/road_network.py` — pure numpy geometry, no Panda3D
+or Qt import. It has since diverged in exactly one place: `_project_full`
+gained a bounding-box broad phase, and `finalize` builds the index for it.
+That was worth breaking the clean diff for, since it was the hottest call in
+a training run; nothing else in the file has been touched, and the heading
+convention is deliberately left as the original's.
 
 ---
 
@@ -402,9 +460,11 @@ conflict — so it keeps its dial.
 - **No pedestrians or other moving non-vehicles.** Dropped from scope.
 - **No per-episode layout variation.** Road closures and blocked lanes are
   fixed per scenario, so a policy can still memorise one map.
-- **No metrics recorder and no learner-facing adapter.** `info` emits
-  per-step costs; nothing aggregates them per episode, and `step` takes and
-  returns lists rather than the shape SB3 or PettingZoo expects.
+- **No metrics recorder.** `info` emits per-step costs; nothing aggregates
+  them per episode into the collision-rate / goal-rate / min-TTC table the
+  results section needs.
+- **No SB3 or PettingZoo adapter.** `VecTrafficEnv` is the vectorised
+  interface, but it is this project's shape, not either library's.
 - **One vehicle type.** `TrafficEnv(vehicle_cls=...)` takes any class with
   `Sedan`'s interface, but only `Sedan` exists so far.
 - **Arcs are lost through a PNG round trip** (see above).

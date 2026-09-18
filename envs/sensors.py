@@ -115,9 +115,30 @@ def lidar(origin, heading: float, boxes: np.ndarray, circles: np.ndarray,
     """
     origin = np.asarray(origin, dtype=float)
     dirs = ray_dirs(heading, n_rays, fov)
-    d = np.minimum(_hit_boxes(origin, dirs, np.asarray(boxes, dtype=float).reshape(-1, 5), max_range),
-                   _hit_circles(origin, dirs, np.asarray(circles, dtype=float).reshape(-1, 3), max_range))
+    boxes = np.asarray(boxes, dtype=float).reshape(-1, 5)
+    circles = np.asarray(circles, dtype=float).reshape(-1, 3)
+    boxes = _in_range(boxes, origin, max_range,
+                      np.hypot(boxes[:, 2], boxes[:, 3]))
+    circles = _in_range(circles, origin, max_range, circles[:, 2])
+    d = np.minimum(_hit_boxes(origin, dirs, boxes, max_range),
+                   _hit_circles(origin, dirs, circles, max_range))
     return d.astype(np.float32)
+
+
+def _in_range(objects: np.ndarray, origin: np.ndarray, max_range: float,
+              radius: np.ndarray) -> np.ndarray:
+    """Drop objects that cannot possibly be hit within `max_range`.
+
+    Exact: an object whose centre is further than `max_range` plus its own
+    circumradius has no point within range, so no ray can reach it. Worth
+    doing because the raycast is O(rays x objects) and most of a town is out
+    of range of any one vehicle — this is the single biggest cost in a step
+    once the road projection is indexed.
+    """
+    if len(objects) == 0:
+        return objects
+    d = np.hypot(objects[:, 0] - origin[0], objects[:, 1] - origin[1])
+    return objects[d - radius <= max_range]
 
 
 def radar(origin, heading: float, velocity, others: np.ndarray,

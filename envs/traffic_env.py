@@ -124,6 +124,21 @@ JERK_TAU = 0.3               # s, acceleration low-pass time constant
 JERK_THRESHOLD = 2.5         # m/s^3 of FILTERED jerk
 
 
+def batch_obs(observations) -> dict:
+    """A list of per-agent observation dicts as one dict of stacked arrays.
+
+    `{"lidar": (n_agents, 120), ...}` rather than `n_agents` dicts each
+    holding four small arrays. Two places want this and for different
+    reasons: a policy wants a batch to forward in one call, and
+    `envs/vec.py` has to put observations through a pipe, where 4 arrays
+    pickle far faster than 80.
+    """
+    if not observations:
+        return {}
+    return {key: np.stack([o[key] for o in observations])
+            for key in observations[0]}
+
+
 def _ramp(value: float, threshold: float) -> float:
     """A violation's severity as a number in [0, 1]: zero at the threshold,
     one at twice it, flat after that.
