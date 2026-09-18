@@ -63,16 +63,20 @@ def draw(world: World, vehicles=None, goals=None, path: str | None = None,
     for (x, y), pad in zip(net.nodes, net.node_pads):
         if pad > 0.0:
             ax.add_patch(Circle((x, y), pad, color=ASPHALT, zorder=2))
-    for piece in net.pieces:
+    for i, piece in enumerate(net.pieces):
         poly = piece.polyline(0.0, piece.length)
         inset = max(piece.half_width - 0.28, 0.05)
         for side in (inset, -inset):
             _ribbon(ax, _offset(poly, side), 0.07, MARKING, zorder=3)
-        if piece.lanes >= 2:
+        # One dashed line per lane divider. A single centre dash was only
+        # ever right for a two-lane road; on a three-lane arterial it drew a
+        # road the lane graph does not agree with.
+        for offset in world.lanes.dividers(i):
             s = 2.25
             while s < piece.length:
                 end = min(s + 3.0, piece.length)
-                _ribbon(ax, piece.polyline(s, end), 0.08, MARKING, zorder=3)
+                _ribbon(ax, _offset(piece.polyline(s, end), -offset), 0.08,
+                        MARKING, zorder=3)
                 s = end + 4.5
     for cx, cy, r in net.islands:
         ax.add_patch(Circle((cx, cy), r, color=ISLAND, zorder=4))

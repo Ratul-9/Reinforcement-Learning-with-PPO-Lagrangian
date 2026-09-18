@@ -64,6 +64,12 @@ RADAR_OBJECTS = 5
 LOOKAHEAD_NEAR = 8.0
 LOOKAHEAD_FAR = 18.0
 
+# The constrained-MDP cost channels, in one place: the env emits exactly
+# these, one Lagrange multiplier and one budget `d_i` belongs to each, and a
+# learner can enumerate them without hard-coding the names a second time.
+COST_CHANNELS = ("collision", "offroad", "wrong_way", "lane_keep",
+                 "ttc", "jerk", "speeding")
+
 # -- cost thresholds (what counts as a violation, NOT what it is worth) ---
 TTC_THRESHOLD = 2.0          # seconds; below this the TTC cost is charged
 JERK_THRESHOLD = 5.0         # m/s^3
@@ -108,9 +114,16 @@ class TrafficEnv(gym.Env):
 
         self.action_space = v.action_space
         self.observation_space = spaces.Dict({
-            # [vx, vy, yaw_rate, steering_angle, gear,
-            #  road_margin, lateral_offset, heading_error]
-            "state": spaces.Box(-np.inf, np.inf, shape=(8,), dtype=np.float32),
+            # [vx, vy, yaw_rate, steering_angle, gear, road_margin,
+            #  heading_error, lane_offset, lane_index_norm, wrong_way]
+            #
+            # `lane_offset` is measured from the centre of the vehicle's OWN
+            # lane, not from the road's centreline: on a three-lane arterial
+            # the centreline offset of a correctly-driven vehicle is several
+            # metres and carries no information about whether it is driving
+            # well. Absolute x/y are deliberately absent — a policy given its
+            # world coordinates memorises the map.
+            "state": spaces.Box(-np.inf, np.inf, shape=(10,), dtype=np.float32),
             # [route_dist, near wp forward, near wp left,
             #  far wp forward, far wp left, bend ahead]
             "navigation": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
@@ -148,21 +161,35 @@ class TrafficEnv(gym.Env):
         """Put agent `i` at a fresh start with a fresh destination.
 
         Retried against the vehicles already placed: two agents spawned into
-        the same parking bay would register a collision on step zero, and a
-        policy cannot be charged for a cost it was handed. The first few
-        attempts use the scenario's declared sources; once those are taken
-        the rest of the traffic is placed anywhere on the network, because a
-        layout declaring two approaches still has to hold twenty vehicles.
+        the same bay would register a collision on step zero, and a policy
+        cannot be charged for a cost it was handed. The first few attempts
+        use the scenario's declared sources; once those are taken the rest of
+        the traffic is placed anywhere on the network, because a layout
+        declaring two approaches still has to hold twenty vehicles.
+
+        The destination is drawn and the pose snapped to its lane INSIDE the
+        retry loop, not after it. Which lane a spawn belongs in depends on
+        which way its route runs, so the snap moves the vehicle — and a
+        clearance test run before that move tests a position the vehicle
+        does not end up in. With every spawn now landing exactly on a lane
+        centre, that stale test let almost every vehicle spawn on top of
+        another one.
         """
         veh = self.vehicles[i]
         others = np.delete(self._rects(), i, axis=0)
         for attempt in range(24):
             x, y, heading = self.world.sample_start(self.rng, declared=attempt < 6)
+            gx, gy, route = self.world.sample_goal(self.rng, (x, y), MIN_ROUTE)
+            x, y, heading = self._snap_to_lane(x, y, (gx, gy), heading)
             rect = (x, y, self.half_length, self.half_width, heading)
-            if not self.world.rect_hits_rects(rect, others).any():
+            clear = not self.world.rect_hits_rects(rect, others).any()
+            # Re-ask the lane graph rather than trusting the snap. Near a
+            # junction — a roundabout entry especially — the piece whose edge
+            # is nearest after the move is not always the piece the snap
+            # measured against, so a pose that was placed correctly on the
+            # approach can read as wrong-way on the ring.
+            if clear and not self.world.locate_lane(x, y, heading).wrong_way:
                 break
-        gx, gy, route = self.world.sample_goal(self.rng, (x, y), MIN_ROUTE)
-        x, y, heading = self._snap_to_lane(x, y, (gx, gy), heading)
 
         veh.reset(spawn_point=(x, y), destination=(gx, gy))
         veh.heading = heading
@@ -192,14 +219,13 @@ class TrafficEnv(gym.Env):
         if math.hypot(dx, dy) < 1e-6:
             return x, y, fallback
         travel = math.atan2(dy, dx)
-        if piece.lanes < 2:
-            return cx, cy, travel
-        # Right of travel is the heading rotated -90 degrees, half this
-        # piece's width out — a one-lane bay has no right-hand lane to sit in.
-        off = piece.half_width / 2.0
-        return (cx + math.sin(travel) * off,
-                cy - math.cos(travel) * off,
-                travel)
+        tx, ty = piece.tangent(s)
+        forward = (math.cos(travel) * tx + math.sin(travel) * ty) >= 0.0
+        lane = self.world.lanes.lane_for_travel(i, forward)
+        # Lane offsets are LEFT-positive relative to the piece's tangent, so
+        # step left of the tangent — not of the travel direction, which is
+        # the opposite way round on a lane running against the piece.
+        return (cx - ty * lane.offset, cy + tx * lane.offset, travel)
 
     # -- geometry helpers -------------------------------------------------
 
@@ -272,15 +298,24 @@ class TrafficEnv(gym.Env):
             else:
                 self._offroad_for[i] = 0.0
 
-            # Lane departure: the vehicle is on the road but not in a lane —
-            # measured as being on the wrong side of the centreline for the
-            # direction it is travelling, which is what makes a head-on
-            # conflict a rule violation and not just bad luck.
-            piece = self.world.net.pieces[self.world.net.project(veh.x, veh.y)[0]]
-            forward = math.cos(wrap_pi(veh.heading - tangent)) >= 0.0
-            if piece.lanes >= 2 and margin >= 0.0:
-                wrong_side = (lateral > 0.0) if forward else (lateral < 0.0)
-                costs["lane"][i] = float(wrong_side)
+            # Two separate lane rules, because they are two different
+            # mistakes and a Lagrange multiplier per cost channel can only
+            # price them separately if they arrive separately.
+            #
+            #   wrong_way   in a lane that runs the other way. A rule
+            #               violation, and the thing that turns a near-miss
+            #               into a head-on.
+            #   lane_keep   drifting off the centre of whatever lane you ARE
+            #               in. Ramped by how far, and only charged past a
+            #               dead band — a vehicle tracking its lane to within
+            #               a few tens of centimetres is driving, not
+            #               violating, and charging it there would make the
+            #               constraint bind on noise.
+            fix = self.world.locate_lane(veh.x, veh.y, veh.heading)
+            if margin >= 0.0:
+                costs["wrong_way"][i] = float(fix.wrong_way)
+                slack = max(fix.lane.width / 2.0 - self.half_width, 0.25)
+                costs["lane_keep"][i] = max(0.0, abs(fix.offset) - slack) / slack
 
             ttc = self._time_to_collision(i, moving)
             if ttc < TTC_THRESHOLD:
@@ -316,7 +351,7 @@ class TrafficEnv(gym.Env):
 
     def _zero_costs(self) -> dict:
         return {k: np.zeros(self.n_agents, dtype=np.float32)
-                for k in ("collision", "offroad", "lane", "ttc", "jerk", "speeding")}
+                for k in COST_CHANNELS}
 
     def _time_to_collision(self, i: int, moving: np.ndarray) -> float:
         """Seconds to the nearest constant-velocity closing conflict.
@@ -369,11 +404,16 @@ class TrafficEnv(gym.Env):
             ff, fl = self._to_ego(veh, far)
             bend = math.atan2(far[1] - near[1], far[0] - near[0])
 
+            fix = self.world.locate_lane(veh.x, veh.y, veh.heading)
+            n_lanes = len(self.world.lanes.lanes(fix.piece))
+            lane_norm = fix.lane.index / max(n_lanes - 1, 1)
+
             out.append({
                 "state": np.array([
                     veh.vx, veh.vy, veh.yaw_rate, veh.steering_angle,
-                    float(veh.gear.value), margin, lateral,
+                    float(veh.gear.value), margin,
                     wrap_pi(veh.heading - tangent),
+                    fix.offset, lane_norm, float(fix.wrong_way),
                 ], dtype=np.float32),
                 "navigation": np.array([
                     route, nf, nl, ff, fl, wrap_pi(bend - veh.heading),

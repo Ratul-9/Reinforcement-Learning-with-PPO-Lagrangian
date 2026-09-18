@@ -148,6 +148,93 @@ def test_every_scenario_steps_with_traffic():
         assert np.all(np.isfinite(obs[0]["lidar"]))
 
 
+def test_lane_graph_layout():
+    """Lane centres, directions and dividers must follow from the lane count
+    alone — that is what lets a PNG-loaded network have lanes without the
+    loader knowing lanes exist."""
+    from envs.lanes import lanes_of
+
+    class FakePiece:
+        def __init__(self, lanes, half_width):
+            self.lanes, self.half_width = lanes, half_width
+
+    one = lanes_of(FakePiece(1, 1.75))
+    assert len(one) == 1 and one[0].offset == 0.0
+    assert one[0].direction == 0, "a single-lane bay has no wrong side"
+
+    two = lanes_of(FakePiece(2, 3.5))
+    assert [ln.offset for ln in two] == [1.75, -1.75]
+    assert [ln.direction for ln in two] == [-1, 1], "right-hand traffic"
+
+    three = lanes_of(FakePiece(3, 5.25))
+    assert [ln.direction for ln in three] == [-1, 0, 1], "odd lane is shared"
+    assert abs(three[1].offset) < 1e-9
+
+    world = World.build("intersection_x", rng=np.random.default_rng(0))
+    for i, piece in enumerate(world.net.pieces):
+        assert len(world.lanes.dividers(i)) == piece.lanes - 1
+
+
+def test_spawns_are_lane_centred_and_right_way():
+    """Every spawn must land on a lane centre, facing the way that lane runs,
+    and clear of the vehicles already placed. All three at once: the lane
+    snap MOVES the vehicle, so a clearance test taken before it is testing a
+    pose the vehicle never occupies."""
+    from envs.traffic_env import TrafficEnv as Env
+
+    for kind in road_network.SCENARIO_KINDS:
+        env = Env(kind, n_agents=20, seed=0)
+        _, info = env.reset()
+        assert info["cost"]["collision"].sum() == 0.0, f"{kind} spawns in collision"
+        for veh in env.vehicles:
+            fix = env.world.locate_lane(veh.x, veh.y, veh.heading)
+            assert not fix.wrong_way, f"{kind} spawns against the traffic"
+            assert abs(fix.offset) < 0.5, f"{kind} spawns off its lane centre"
+
+
+def test_wrong_way_cost_fires():
+    """Turn a vehicle round on a two-way road and the wrong-way cost must
+    charge while the lane-keeping cost does not — they are separate
+    mistakes and each gets its own multiplier."""
+    from envs.traffic_env import TrafficEnv as Env
+
+    env = Env("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env.reset()
+    veh = env.vehicles[0]
+    veh.heading += math.pi                       # same lane, facing back
+    _, _, _, _, info = env.step([drive(throttle=0.0)])
+    assert info["cost"]["wrong_way"][0] == 1.0, "wrong-way cost never fired"
+    assert info["cost"]["lane_keep"][0] == 0.0, "still centred in its lane"
+
+
+def test_lane_keep_cost_fires():
+    """Slide a vehicle off its lane centre, staying on the road, and the
+    lane-keeping cost must charge and grow with the error."""
+    from envs.traffic_env import TrafficEnv as Env
+
+    env = Env("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env.reset()
+    veh = env.vehicles[0]
+    fix = env.world.locate_lane(veh.x, veh.y, veh.heading)
+    piece = env.world.net.pieces[fix.piece]
+    tx, ty = piece.tangent(fix.s)
+    x0, y0 = veh.x, veh.y
+    # Drift toward the road's centreline, not away from it: the spawn lane
+    # may be either side, and drifting outward would leave the carriageway
+    # and charge the off-road cost instead of the one under test.
+    inward = -1.0 if fix.lane.offset > 0 else 1.0
+
+    charged = []
+    for shift in (0.0, 0.8, 1.4):
+        shift *= inward
+        veh.x, veh.y = x0 - ty * shift, y0 + tx * shift
+        _, _, _, _, info = env.step([drive(throttle=0.0)])
+        assert info["cost"]["offroad"][0] == 0.0, "drifted clean off the road"
+        charged.append(float(info["cost"]["lane_keep"][0]))
+    assert charged[0] == 0.0, "a centred vehicle was charged"
+    assert charged[2] > charged[1] > 0.0, f"cost did not ramp: {charged}"
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be

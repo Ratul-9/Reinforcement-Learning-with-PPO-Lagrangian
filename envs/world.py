@@ -26,6 +26,7 @@ import math
 import numpy as np
 
 from envs import road_network, scenery
+from envs.lanes import LaneGraph
 
 
 def h_to_rad(h_deg: float) -> float:
@@ -53,6 +54,10 @@ class World:
         self.net = net
         self.scenery = objects
         self.spec = dict(spec)
+        # Derived, not stored: the lane count on each piece already implies
+        # the lanes, so a network from any source gets them without the
+        # builders (or the PNG loader) knowing lanes exist.
+        self.lanes = LaneGraph(net)
 
         # Buildings as (N, 5) for the raycast: cx, cy, hl, hw, yaw.
         self.static_boxes = objects.boxes[:, :5].astype(np.float32).copy()
@@ -204,6 +209,10 @@ class World:
 
     def route_probe(self, a_xy, b_xy, lookaheads):
         return self.net.route_probe(a_xy, b_xy, lookaheads)
+
+    def locate_lane(self, x: float, y: float, heading: float):
+        """Which lane this pose is in and whether it faces the right way."""
+        return self.lanes.locate(float(x), float(y), float(heading))
 
     def bounds(self):
         """Network bounds widened to cover the scenery that was placed around

@@ -197,18 +197,20 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
     paint = _Mesh("markings", MARKING)
     pads = _Mesh("pads", ASPHALT)
     islands = _Mesh("islands", ISLAND)
-    for piece in world.net.pieces:
+    for i, piece in enumerate(world.net.pieces):
         poly = piece.polyline(0.0, piece.length)
         _ribbon(surface, poly, piece.half_width, ROAD_Z)
         inset = max(piece.half_width - _EDGE_INSET, 0.05)
         for side in (inset, -inset):
             _ribbon(paint, _offset(poly, side), _EDGE_WIDTH / 2.0, MARK_Z)
-        if piece.lanes >= 2:
+        # One dashed line per lane divider, from the lane graph — so what is
+        # painted is what the lane-keeping cost is measured against.
+        for offset in world.lanes.dividers(i):
             s = _DASH_OFF / 2.0
             while s < piece.length:
                 end = min(s + _DASH_ON, piece.length)
                 if end - s > 0.4:
-                    _ribbon(paint, piece.polyline(s, end),
+                    _ribbon(paint, _offset(piece.polyline(s, end), -offset),
                             _CENTRE_WIDTH / 2.0, MARK_Z)
                 s = end + _DASH_OFF
     for (nx, ny), r in zip(world.net.nodes, world.net.node_pads):
