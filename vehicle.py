@@ -5,6 +5,10 @@ from gymnasium import spaces
 
 from fleet import SEDAN, VehicleSpec
 
+# Physics sub-steps per control step. Sized so the stiff lateral dynamics
+# stay stable down to the speed at which the kinematic model takes over.
+PHYSICS_SUBSTEPS = 10
+
 class Gear(Enum):
     PARK = 0
     REVERSE = 1
@@ -33,6 +37,8 @@ class Vehicle:
         # Environment properties
         self.dt = dt
         self.spec = spec
+        # See `step` for why this is 10 and not 1.
+        self.substeps = PHYSICS_SUBSTEPS
         self.spawn_point = np.array(spawn_point, dtype=np.float32)
         self.destination = np.array(destination, dtype=np.float32)
         
@@ -155,7 +161,37 @@ class Vehicle:
         elif gear_input == 3: self.gear = Gear.DRIVE
             
         self.steering_angle = steering_input * self.max_steer_angle
-        
+
+        # Integrate the physics on a finer grid than the control period.
+        #
+        # This is not polish, it is correctness. The lateral dynamics are
+        # stiff: explicit Euler needs dt * (Cf + Cr) / (m * vx) < 2, i.e.
+        # vx > 6.7 m/s at a 0.1 s step. Below that the integration is
+        # unstable, and because the friction clip bounds the force it does
+        # not blow up — it settles into a limit cycle that looks like
+        # plausible noise. Measured before this existed, holding a constant
+        # 0.3 steering input at 3 m/s: the bus locked into a two-cycle
+        # (+0.10, +0.14, +0.10, ...) and the tuktuk oscillated between -0.19
+        # and +1.16 rad/s, changing sign 20 times in 24 steps. A parking
+        # manoeuvre lives entirely in that band.
+        #
+        # At dt/10 the bound falls to 0.67 m/s, below the speed at which the
+        # kinematic fallback takes over, so the whole operating range is
+        # stable. Forces are recomputed per sub-step because drag and
+        # braking both depend on the speed being integrated.
+        for _ in range(self.substeps):
+            self._advance(self.dt / self.substeps, throttle_input,
+                          brake_input, slope_angle)
+
+        # Governor and heading wrap apply once per control step, not per
+        # sub-step: they are limits on the reported state, not forces.
+        self.vx = float(np.clip(self.vx, -self.max_speed, self.max_speed))
+        self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
+
+        return self.get_observation(external_sensors)
+
+    def _advance(self, dt, throttle_input, brake_input, slope_angle):
+        """One physics sub-step of length `dt`."""
         # --- Longitudinal Forces ---
         Fx = 0.0
         force_gravity = -self.mass * self.gravity * np.sin(slope_angle)
@@ -183,22 +219,41 @@ class Vehicle:
         if velocity_mag < 1.0:
             # Kinematic update
             acceleration = Fx / self.mass
+            vx_before = self.vx
             if self.gear == Gear.PARK:
                 self.vx = 0.0
             else:
-                self.vx += acceleration * self.dt
+                self.vx += acceleration * dt
                 
             self.vy = 0.0
             self.yaw_rate = (self.vx / self.wheelbase) * np.tan(self.steering_angle)
             
-            # Stop completely logic
-            if abs(self.vx) < 0.1 and (brake_input > 0 or self.gear == Gear.PARK):
+            # Come to a complete stop rather than creeping or juddering —
+            # but as a physical rule, not a speed threshold.
+            #
+            # This used to be `abs(vx) < 0.1 and braking -> vx = 0`, which is
+            # frame-rate dependent in a way that only showed up once the
+            # integrator was sub-stepped: with dt = 0.01 a vehicle gains
+            # 0.03 m/s per sub-step, so it can never clear a 0.1 m/s gate
+            # that is re-applied every sub-step, and a vehicle holding both
+            # throttle and brake stayed pinned at exactly zero forever.
+            #
+            # The rule brakes are actually subject to is that they can bring
+            # you to rest but cannot push you backwards, so the test is
+            # whether this sub-step would have reversed the direction of
+            # travel. That is identical at every `dt`.
+            # `vx_before != 0` matters: without it, a vehicle pulling away
+            # from rest with any brake applied has vx_before * vx == 0 and
+            # gets pinned at zero forever. Brakes resist motion; they do not
+            # prevent a standing start.
+            stopping = brake_input > 0 or self.gear == Gear.PARK
+            if stopping and vx_before != 0.0 and vx_before * self.vx <= 0.0:
                 self.vx = 0.0
                 self.yaw_rate = 0.0
                 
-            self.x += self.vx * np.cos(self.heading) * self.dt
-            self.y += self.vx * np.sin(self.heading) * self.dt
-            self.heading += self.yaw_rate * self.dt
+            self.x += self.vx * np.cos(self.heading) * dt
+            self.y += self.vx * np.sin(self.heading) * dt
+            self.heading += self.yaw_rate * dt
             
         else:
             # 4-Wheel Dynamic Model update
@@ -226,7 +281,8 @@ class Vehicle:
             # 3. Compute static normal forces (ignoring dynamic weight transfer for stability)
             Fz_f = (self.mass * self.gravity * self.lr) / self.wheelbase
             Fz_r = (self.mass * self.gravity * self.lf) / self.wheelbase
-            Fz_wheel = Fz_f / 2.0 # simplified per-wheel normal force
+            Fz_front_wheel = Fz_f / 2.0
+            Fz_rear_wheel = Fz_r / 2.0
             
             # 4. Compute lateral forces using linear tire model
             Fy_fl = (self.Cf / 2.0) * alpha_fl
@@ -234,12 +290,17 @@ class Vehicle:
             Fy_rl = (self.Cr / 2.0) * alpha_rl
             Fy_rr = (self.Cr / 2.0) * alpha_rr
             
-            # Clip forces to friction circle limits
-            max_lat_force = self.mu * Fz_wheel
-            Fy_fl = np.clip(Fy_fl, -max_lat_force, max_lat_force)
-            Fy_fr = np.clip(Fy_fr, -max_lat_force, max_lat_force)
-            Fy_rl = np.clip(Fy_rl, -max_lat_force, max_lat_force)
-            Fy_rr = np.clip(Fy_rr, -max_lat_force, max_lat_force)
+            # Clip each tyre to the grip its OWN axle load can supply.
+            # Fz_r was previously computed and then never used, so the rear
+            # tyres were allowed the front axle's limit — on a
+            # front-heavy car that is ~33% more rear grip than physical,
+            # which biases every vehicle toward understeer for free.
+            max_front = self.mu * Fz_front_wheel
+            max_rear = self.mu * Fz_rear_wheel
+            Fy_fl = np.clip(Fy_fl, -max_front, max_front)
+            Fy_fr = np.clip(Fy_fr, -max_front, max_front)
+            Fy_rl = np.clip(Fy_rl, -max_rear, max_rear)
+            Fy_rr = np.clip(Fy_rr, -max_rear, max_rear)
             
             # Combine forces for equations of motion
             FyF = Fy_fl + Fy_fr
@@ -256,27 +317,18 @@ class Vehicle:
             yaw_accel = (self.lf * FyF * np.cos(self.steering_angle) - self.lr * FyR) / self.Iz
             
             # 6. Euler Integration
-            self.vx += ax * self.dt
-            self.vy += ay * self.dt
-            self.yaw_rate += yaw_accel * self.dt
+            self.vx += ax * dt
+            self.vy += ay * dt
+            self.yaw_rate += yaw_accel * dt
             
             # 7. Update Global Position
             X_dot = self.vx * np.cos(self.heading) - self.vy * np.sin(self.heading)
             Y_dot = self.vx * np.sin(self.heading) + self.vy * np.cos(self.heading)
             
-            self.x += X_dot * self.dt
-            self.y += Y_dot * self.dt
-            self.heading += self.yaw_rate * self.dt
+            self.x += X_dot * dt
+            self.y += Y_dot * dt
+            self.heading += self.yaw_rate * dt
             
-        # Governor. Without it every spec shares the sedan's top speed,
-        # because nothing else in the model bounds velocity except drag —
-        # and drag alone lets a 450 kg tuktuk reach motorway speed.
-        self.vx = float(np.clip(self.vx, -self.max_speed, self.max_speed))
-
-        # Normalize heading to [-pi, pi]
-        self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
-        
-        return self.get_observation(external_sensors)
         
     def get_observation(self, external_sensors=None):
         """

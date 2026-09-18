@@ -341,6 +341,19 @@ class World:
         out = shifted
         return out, remaining
 
+    def to_lane_point(self, point, travel_heading: float):
+        """A point on the centreline, moved into the lane a vehicle heading
+        `travel_heading` belongs in. The heading comes from the route rather
+        than from the vehicle, so the shift is still right on the far side
+        of a junction the vehicle has not reached."""
+        i, s, _lateral, _d = self.net.project(point[0], point[1])
+        piece = self.net.pieces[i]
+        tx, ty = piece.tangent(s)
+        forward = (math.cos(travel_heading) * tx
+                   + math.sin(travel_heading) * ty) >= 0.0
+        lane = self.lanes.lane_for_travel(i, forward)
+        return (point[0] - ty * lane.offset, point[1] + tx * lane.offset)
+
     def _to_lane(self, came_from, point):
         """One centreline point, moved into the lane a vehicle traveling
         `came_from -> point` belongs in."""

@@ -395,7 +395,12 @@ def test_costs_are_bounded():
             assert np.all(channel >= 0.0), f"{k} went negative"
             assert np.all(channel <= 1.0), f"{k} exceeded 1.0: {channel.max()}"
             peak[k] = max(peak[k], float(channel.max()))
-    assert peak["jerk"] > 0.0, "random actions produced no jerk at all"
+    # No assertion that a particular channel fires here — this test is about
+    # the BOUND. Random actions mostly leave vehicles parked, and once the
+    # integrator was sub-stepped they stopped generating jerk at all, which
+    # was the point: that jerk had been integration noise. Each channel has
+    # its own firing test.
+    assert any(v > 0.0 for v in peak.values()), "no cost fired at all"
 
 
 def test_jerk_ignores_control_rate():
@@ -549,6 +554,160 @@ def test_blockages_are_on_the_road_and_seen():
     ranges = sensors.lidar(origin, float(yaw), world.static_boxes,
                            world.static_circles, n_rays=72, max_range=100.0)
     assert ranges.min() < 25.0, "lidar cannot see a stalled vehicle 20 m ahead"
+
+
+def test_dynamics_match_theory():
+    """The vehicle model must agree with theory where theory is unambiguous.
+
+    Two regimes, and a correct model has to hit both:
+
+    * **Low speed** — the vehicle turns on geometry. Steady-state yaw rate is
+      the bicycle value `vx / L * tan(delta)`, and body slip at the CG is
+      `atan(lr * tan(delta) / L)` (non-zero, and not a defect: the CG is not
+      on the rear axle).
+    * **High speed** — the tyres run out. Yaw rate is capped by grip at
+      `mu * g / vx`, so a vehicle *must* understeer rather than follow the
+      kinematic value, which at 20 m/s and a third of lock would demand 2.7 g.
+
+    This caught a real bug. Explicit Euler on the stiff lateral dynamics
+    needs `dt * (Cf + Cr) / (m * vx) < 2` — vx > 6.7 m/s at a 0.1 s step —
+    and the friction clip bounded the resulting instability into a limit
+    cycle instead of a blow-up, so it read as plausible noise. At 3 m/s the
+    tuktuk oscillated between -0.19 and +1.16 rad/s for a constant steering
+    input. Sub-stepping the integration fixed it; this test is what stops it
+    coming back.
+    """
+    from vehicle import Vehicle, Gear
+    from fleet import FLEET
+
+    def hold(spec, vx, steer_cmd, steps=80):
+        veh = Vehicle(spec=spec, dt=0.1)
+        veh.vx, veh.vy, veh.yaw_rate, veh.heading = vx, 0.0, 0.0, 0.0
+        veh.gear = Gear.DRIVE
+        trace = []
+        for _ in range(steps):
+            veh.step({"steering": np.array([steer_cmd], np.float32),
+                      "throttle": np.array([0.0], np.float32),
+                      "brake": np.array([0.0], np.float32), "gear": 3})
+            veh.vx = vx                      # hold speed, isolate lateral
+            trace.append(veh.yaw_rate)
+        return veh, np.array(trace)
+
+    for name in ("sedan", "bus", "tuktuk", "truck", "motorcycle"):
+        spec = FLEET[name]
+        for vx in (1.5, 3.0, 5.0):
+            veh, trace = hold(spec, vx, 0.3)
+            delta = veh.steering_angle
+
+            # Settled, not ringing: the last quarter must be flat.
+            spread = float(np.ptp(trace[-20:]))
+            assert spread < 0.02, \
+                f"{name} at {vx} m/s oscillates: spread {spread:.3f} rad/s"
+
+            r_kin = vx / spec.wheelbase * math.tan(delta)
+            assert abs(veh.yaw_rate - r_kin) < 0.12 * abs(r_kin) + 0.02, \
+                f"{name} at {vx} m/s: yaw {veh.yaw_rate:.3f} vs kinematic {r_kin:.3f}"
+
+            slip_expected = math.atan(spec.lr * math.tan(delta) / spec.wheelbase)
+            slip = math.atan2(veh.vy, vx)
+            assert abs(slip - slip_expected) < math.radians(4.0), \
+                f"{name} at {vx} m/s: body slip {math.degrees(slip):.1f} deg " \
+                f"vs expected {math.degrees(slip_expected):.1f}"
+
+    # High speed: grip-limited, and the limit is the right number.
+    veh, _ = hold(FLEET["sedan"], 20.0, 0.3)
+    lateral_g = 20.0 * abs(veh.yaw_rate)
+    assert lateral_g <= FLEET["sedan"].effective_mu * 9.81 * 1.1, \
+        f"cornering at {lateral_g:.1f} m/s^2 exceeds available grip"
+    assert lateral_g > 0.6 * FLEET["sedan"].effective_mu * 9.81, \
+        f"only {lateral_g:.1f} m/s^2 of a possible " \
+        f"{FLEET['sedan'].effective_mu * 9.81:.1f} — not using the tyres"
+
+
+def test_rear_axle_carries_its_own_load():
+    """Each tyre is limited by the load on ITS axle.
+
+    Fz_r was computed and then never used: the rear tyres were clipped at the
+    front axle's limit, which on a front-heavy car is ~33% more rear grip
+    than physics allows, and quietly biases every vehicle toward understeer.
+    """
+    from vehicle import Vehicle
+    from fleet import SEDAN
+
+    veh = Vehicle(spec=SEDAN)
+    front_load = veh.mass * veh.gravity * veh.lr / veh.wheelbase
+    rear_load = veh.mass * veh.gravity * veh.lf / veh.wheelbase
+    assert abs(front_load + rear_load - veh.mass * veh.gravity) < 1.0
+    assert front_load != rear_load, "a symmetric CG cannot detect this bug"
+
+    import inspect
+    source = inspect.getsource(Vehicle._advance)
+    assert "Fz_rear_wheel" in source and "max_rear" in source, \
+        "rear tyres are not clipped against the rear axle load"
+
+
+def test_progress_cannot_exceed_distance_travelled():
+    """The progress reward must never pay more than the vehicle moved.
+
+    `route_distance` re-solved the shortest path from the vehicle's
+    projection every step, and that answer jumps when the projection
+    switches piece — at a junction, a bay mouth, anywhere two pieces
+    overlap. Measured on manhattan with 16 agents: 257 steps where the route
+    distance moved further than the vehicle did, largest +255 m. On a 150 m
+    route that single step pays 1.7, where arriving pays 1.0. A policy finds
+    that long before a human notices it.
+
+    Fixed twice over, because the two halves fail differently: the route is
+    now solved once per episode and walked (which also stops the observation
+    and the goal test jumping, which a reward clamp cannot), and the reward
+    is clamped to distance driven (which catches a vehicle re-attaching to
+    its route after being shoved off it).
+    """
+    from rollout import pure_pursuit
+
+    env = TrafficEnv("manhattan", n_agents=16, seed=1)
+    obs, info = env.reset()
+    fresh = np.ones(env.n_agents, dtype=bool)
+    prev = np.array([(v.x, v.y) for v in env.vehicles])
+
+    worst = 0.0
+    for _ in range(300):
+        obs, reward, term, trunc, info = env.step([pure_pursuit(o) for o in obs])
+        now = np.array([(v.x, v.y) for v in env.vehicles])
+        for i in range(env.n_agents):
+            # Terminal steps are excluded because the env respawns inside
+            # step(), so _route0 already belongs to the next episode.
+            if not info["active"][i] or fresh[i] or term[i] or trunc[i]:
+                continue
+            moved = math.hypot(*(now[i] - prev[i]))
+            gained = abs(float(reward[i]) * env._route0[i])
+            worst = max(worst, gained - moved)
+        fresh = np.array(term) | np.array(trunc) | ~np.array(info["active"])
+        prev = now
+
+    assert worst < 0.5, f"unearned progress of {worst:.2f} m in one step"
+
+
+def test_route_tracker_is_monotone():
+    """Walking the route must not jump backwards when the path passes near
+    itself — a loop, a block circled twice, a roundabout."""
+    from envs.route import RouteTracker
+
+    world = bare("loop")
+    net = world.net
+    rng = np.random.default_rng(0)
+    x, y, _h = world.sample_start(rng, declared=False)
+    gx, gy, _ = world.sample_goal(rng, (x, y), 60.0)
+    tracker = RouteTracker(net, (x, y), (gx, gy))
+
+    # Walk the polyline itself: s must increase monotonically the whole way.
+    last_s = -1.0
+    for point in tracker.poly:
+        tracker.advance(float(point[0]), float(point[1]))
+        assert tracker.s >= last_s - 1e-6, \
+            f"route position went backwards: {last_s:.2f} -> {tracker.s:.2f}"
+        last_s = tracker.s
+    assert tracker.remaining() < 1.0, "walking the whole route did not finish it"
 
 
 def test_contract_is_stable():

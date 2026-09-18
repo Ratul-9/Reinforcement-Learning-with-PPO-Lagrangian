@@ -46,6 +46,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from envs import sensors
+from envs.route import RouteTracker
 from envs.world import World, wrap_pi
 from vehicle import Vehicle, Sedan, Gear
 import fleet
@@ -287,6 +288,11 @@ class TrafficEnv(gym.Env):
         # a different point of its own episode, so one shared step counter
         # would time all of them out together — re-synchronising exactly what
         # the staggering is for.
+        # One fixed route per agent per episode. Solved when the goal is
+        # assigned and then walked, instead of re-solved every step — see
+        # envs/route.py for the 255 m reward jumps that caused.
+        self._routes: list = [None] * self.n_agents
+        self._prev_xy = np.zeros((self.n_agents, 2))
         self._age = np.zeros(self.n_agents, dtype=int)
         self._active = np.zeros(self.n_agents, dtype=bool)
         self._wait = np.zeros(self.n_agents)     # seconds until arrival
@@ -449,8 +455,12 @@ class TrafficEnv(gym.Env):
         veh.heading = heading
         veh.gear = Gear.DRIVE
         self._goals[i] = (gx, gy)
+        tracker = RouteTracker(self.world.net, (x, y), (gx, gy))
+        self._routes[i] = tracker
+        route = tracker.advance(x, y)
         self._route0[i] = max(route, 1.0)
         self._route_prev[i] = route
+        self._prev_xy[i] = (x, y)
         self._offroad_for[i] = 0.0
         self._accel_filt[i] = 0.0
         return True
@@ -549,12 +559,26 @@ class TrafficEnv(gym.Env):
                 events.append("")
                 continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
-            route = self.world.net.route_distance((veh.x, veh.y), tuple(self._goals[i]))
+            route = self._routes[i].advance(veh.x, veh.y)
 
             # -- reward: progress along the route, and arriving ------------
-            progress = self._route_prev[i] - route
+            #
+            # Clamped to the distance actually driven. Tracking a fixed
+            # route removed the catastrophic case — re-solving the graph
+            # every step produced jumps of +255 m, worth more than arriving
+            # — but a vehicle shoved off its route by a collision, or
+            # detouring round a stalled lorry, still re-attaches somewhere
+            # further along, and that re-attachment is free progress.
+            #
+            # The clamp is exact rather than a fudge: you cannot advance
+            # along a path further than you moved. Measured at 118 of 14400
+            # agent-steps before it, worst case 13 m of unearned progress.
+            moved = math.hypot(veh.x - self._prev_xy[i][0],
+                               veh.y - self._prev_xy[i][1])
+            progress = np.clip(self._route_prev[i] - route, -moved, moved)
             rewards[i] = progress / self._route0[i]
             self._route_prev[i] = route
+            self._prev_xy[i] = (veh.x, veh.y)
             event = ""
             if route <= GOAL_RADIUS:
                 rewards[i] += 1.0
@@ -720,10 +744,15 @@ class TrafficEnv(gym.Env):
                 continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
             goal = tuple(self._goals[i])
-            # Lane-aware, not centreline: steering straight at a centreline
-            # waypoint is steering into the oncoming lane on a two-way road.
-            (near, far), route = self.world.lane_waypoints(
-                (veh.x, veh.y), goal, (LOOKAHEAD_NEAR, LOOKAHEAD_FAR))
+            # Walked along this episode's fixed route, then shifted into
+            # lane. Re-solving the graph per waypoint was both the slowest
+            # part of the step and the source of the discontinuity.
+            tracker = self._routes[i]
+            route = tracker.remaining()
+            near, far = (self.world.to_lane_point(p, tracker.heading_at(la))
+                         for p, la in zip(
+                             tracker.waypoints((LOOKAHEAD_NEAR, LOOKAHEAD_FAR)),
+                             (LOOKAHEAD_NEAR, LOOKAHEAD_FAR)))
 
             # Other vehicles are obstacles to the lidar exactly as buildings
             # are; the beam does not know the difference and neither should
