@@ -1,0 +1,206 @@
+"""Self-check for the env stack. Run it after touching anything in envs/.
+
+    conda run -n py310 python test_envs.py
+
+Asserts the things that are expensive to notice later: that every scenario
+builds and steps, that each cost channel can actually fire (a cost that never
+fires is a constraint the Lagrange multiplier will drive to zero and a result
+that quietly means nothing), that the lidar agrees with the geometry it is
+cast against, and that the two heading conventions round-trip.
+"""
+
+import math
+
+import numpy as np
+
+from envs import road_network, sensors
+from envs.world import World, h_to_rad, rad_to_h
+from envs.traffic_env import TrafficEnv
+from vehicle import Gear
+
+
+def drive(throttle=0.6, steering=0.0, brake=0.0, gear=3):
+    return {"steering": np.array([steering], dtype=np.float32),
+            "throttle": np.array([throttle], dtype=np.float32),
+            "brake": np.array([brake], dtype=np.float32),
+            "gear": gear}
+
+
+def test_headings_round_trip():
+    for deg in (-180.0, -90.0, 0.0, 45.0, 179.0):
+        assert abs(rad_to_h(h_to_rad(deg)) - deg) < 1e-9, deg
+    # The convention itself: H = -90 is travel along +X.
+    assert abs(h_to_rad(-90.0)) < 1e-9
+
+
+def test_every_scenario_builds():
+    for kind in road_network.KINDS:
+        world = World.build(kind, rng=np.random.default_rng(0))
+        assert len(world.net.pieces) > 0, kind
+        x0, y0, x1, y1 = world.bounds()
+        assert x1 > x0 and y1 > y0, kind
+    for kind in road_network.SCENARIO_KINDS:
+        net = World.build(kind).net
+        assert net.sources and net.goals, f"{kind} declares no source/goal"
+
+
+def test_scenery_is_off_the_road():
+    world = World.build("manhattan", rng=np.random.default_rng(3))
+    assert len(world.scenery.boxes) > 0 and len(world.scenery.trees) > 0
+    for cx, cy, *_ in world.scenery.boxes:
+        assert not world.net.is_on_road(float(cx), float(cy)), "building on the road"
+    for cx, cy, *_ in world.scenery.trees:
+        assert not world.net.is_on_road(float(cx), float(cy)), "tree on the road"
+
+
+def test_lidar_matches_geometry():
+    # One box 20 m dead ahead, one tree 10 m to the left, nothing else.
+    boxes = np.array([[20.0, 0.0, 2.0, 2.0, 0.0]])
+    circles = np.array([[0.0, 10.0, 1.0]])
+    r = sensors.lidar((0.0, 0.0), 0.0, boxes, circles, n_rays=4, fov=2 * math.pi,
+                      max_range=100.0)
+    # A 4-ray full sweep runs -180, -90, 0, +90 relative to the heading.
+    assert abs(r[0] - 100.0) < 1e-3, r          # behind: nothing
+    assert abs(r[1] - 100.0) < 1e-3, r          # right: nothing
+    assert abs(r[2] - 18.0) < 1e-3, r           # ahead: box face at 20-2
+    assert abs(r[3] - 9.0) < 1e-3, r            # left: tree surface at 10-1
+
+
+def test_overlap_tests():
+    world = World.build("cross", rng=np.random.default_rng(0), scenery_density=0.0)
+    a = (0.0, 0.0, 2.5, 1.0, 0.0)
+    # Overlapping, touching-but-rotated, and clear.
+    near = np.array([[3.0, 0.0, 2.5, 1.0, 0.0],
+                     [0.0, 0.0, 2.5, 1.0, math.pi / 2],
+                     [20.0, 0.0, 2.5, 1.0, 0.0]])
+    hits = world.rect_hits_rects(a, near)
+    assert list(hits) == [True, True, False], hits
+    circles = np.array([[2.0, 0.0, 1.0], [30.0, 0.0, 1.0]])
+    assert list(world.rect_hits_circles(a, circles)) == [True, False]
+
+
+def test_offroad_cost_fires():
+    """Drive straight off the side of the road and the off-road cost must
+    charge, then the episode must end once the grace window is used up."""
+    env = TrafficEnv("cross", n_agents=1, seed=0, scenery_density=0.0)
+    env.reset()
+    veh = env.vehicles[0]
+    # Point it across the carriageway rather than along it.
+    _, _, tangent = env.world.road_state(veh.x, veh.y)
+    veh.heading = tangent + math.pi / 2
+    charged = ended = False
+    for _ in range(60):
+        _, _, term, _, info = env.step([drive(throttle=1.0)])
+        charged |= info["cost"]["offroad"][0] > 0.0
+        if term[0]:
+            ended = True
+            break
+    assert charged, "off-road cost never fired"
+    assert ended, "off-road episode never terminated"
+
+
+def test_collision_cost_fires():
+    """Two vehicles placed nose to nose must register a collision."""
+    env = TrafficEnv("cross", n_agents=2, seed=0, scenery_density=0.0)
+    env.reset()
+    a, b = env.vehicles
+    b.x, b.y, b.heading = a.x + 1.0, a.y, a.heading
+    _, _, term, _, info = env.step([drive(throttle=0.0), drive(throttle=0.0)])
+    assert info["cost"]["collision"].sum() == 2.0, info["cost"]["collision"]
+    assert all(term)
+
+
+def test_progress_reward_is_signed_by_direction():
+    """Driving along the route must pay; driving away from it must not."""
+    env = TrafficEnv("cross", n_agents=1, seed=2, scenery_density=0.0)
+    env.reset()
+    veh = env.vehicles[0]
+    goal = tuple(env._goals[0])
+    (waypoint,), _ = env.world.route_probe((veh.x, veh.y), goal, (10.0,))
+    veh.heading = math.atan2(waypoint[1] - veh.y, waypoint[0] - veh.x)
+    veh.gear = Gear.DRIVE
+    toward = sum(env.step([drive(throttle=1.0)])[1][0] for _ in range(20))
+
+    env.reset()
+    veh = env.vehicles[0]
+    goal = tuple(env._goals[0])
+    (waypoint,), _ = env.world.route_probe((veh.x, veh.y), goal, (10.0,))
+    veh.heading = math.atan2(waypoint[1] - veh.y, waypoint[0] - veh.x) + math.pi
+    veh.gear = Gear.DRIVE
+    away = sum(env.step([drive(throttle=1.0)])[1][0] for _ in range(20))
+
+    assert toward > 0.0, f"driving toward the goal paid {toward}"
+    assert toward > away, f"toward={toward} away={away}"
+
+
+def test_every_scenario_steps_with_traffic():
+    for kind in road_network.SCENARIO_KINDS:
+        env = TrafficEnv(kind, n_agents=12, seed=1)
+        obs, info = env.reset()
+        assert info["cost"]["collision"].sum() == 0.0, f"{kind} spawns in collision"
+        assert len(obs) == 12
+        for _ in range(10):
+            obs, rew, term, trunc, info = env.step(
+                [env.action_space.sample() for _ in range(12)])
+        for key, value in info["cost"].items():
+            assert value.shape == (12,), (kind, key)
+            assert np.all(value >= 0.0), f"{kind}: {key} went negative"
+        assert np.all(np.isfinite(obs[0]["lidar"]))
+
+
+def test_png_round_trip():
+    """A world saved as a classified PNG must load back as an equivalent
+    world — same layout, same buildings, same endpoints — and must be
+    drivable. Lengths are compared loosely: the skeleton wanders a little
+    inside a wide carriageway and arcs come back as chains of chords."""
+    import tempfile, os
+
+    from envs import png_map
+    from envs.traffic_env import TrafficEnv as Env
+
+    world = World.build("intersection_x", rng=np.random.default_rng(0))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = png_map.save(world, os.path.join(tmp, "map.png"))
+        loaded = png_map.load(path)
+
+    assert len(loaded.scenery.boxes) == len(world.scenery.boxes)
+    assert len(loaded.net.sources) == len(world.net.sources)
+    assert len(loaded.net.goals) == len(world.net.goals)
+    ratio = loaded.net.total_length / world.net.total_length
+    assert 0.9 < ratio < 1.2, f"road length changed by {ratio:.2f}x"
+
+    env = Env("intersection_x", n_agents=4, seed=0, world=loaded)
+    env.reset()
+    for _ in range(10):
+        env.step([env.action_space.sample() for _ in range(4)])
+
+
+def test_renderers_produce_frames():
+    """Both renderers must return a real image of the same world. The 3D one
+    is skipped when no GL context can be created (a headless CI box without
+    a GPU), because a missing renderer is not a broken env."""
+    from envs import render_mpl
+
+    world = World.build("cross", rng=np.random.default_rng(0))
+    frame = render_mpl.draw(world)
+    assert frame.ndim == 3 and frame.shape[2] == 3 and frame.dtype == np.uint8
+    assert frame.std() > 1.0, "top-down frame is a flat colour"
+
+    try:
+        from envs.render3d import Renderer3D
+        renderer = Renderer3D(world, size=(160, 120))
+    except Exception as exc:                     # no GL context available
+        print(f"    (3D renderer skipped: {exc})")
+        return
+    frame = renderer.frame(camera="orbit")
+    assert frame.shape == (120, 160, 3), frame.shape
+    assert frame.std() > 1.0, "3D frame is a flat colour"
+    renderer.close()
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for fn in tests:
+        fn()
+        print(f"ok  {fn.__name__}")
+    print(f"\n{len(tests)} checks passed")

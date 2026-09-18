@@ -1,0 +1,20 @@
+# Core env stack — everything in envs/ runs on these four.
+numpy
+scipy
+gymnasium
+matplotlib
+
+# 3D renderer (envs/render3d.py). Offscreen by default; the env itself never
+# imports it, so a headless box that cannot create a GL context still trains.
+panda3d==1.10.16
+
+# PNG maps (envs/png_map.py): skeletonise painted roads into a centreline
+# graph, and fit building footprints to painted blocks.
+scikit-image
+opencv-python
+Pillow
+
+# Training. Not imported by envs/ — add the learner you settle on.
+torch
+stable-baselines3
+tensorboard
