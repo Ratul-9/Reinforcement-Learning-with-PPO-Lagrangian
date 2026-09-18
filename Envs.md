@@ -47,8 +47,34 @@ info["cost"]["collision"]      # (n_agents,) — one entry per cost channel
 Everything is a list of length `n_agents`: this IS the vectorised interface,
 with the shared world as the only coupling between agents.
 
+### Arrivals are staggered
+
+Vehicles do not all appear at once. Half the fleet is on the road at reset
+and the rest trickle in over the next 25 s; a vehicle that crashes or
+arrives waits an Exponential(4 s) before returning. Spawning everything at
+reset makes every conflict a consequence of one simultaneous placement —
+the same cars meet at the same junctions at the same times, and a policy can
+learn that schedule instead of learning to drive.
+
+`info["active"]` is the boolean mask of who is actually on the road. A
+waiting vehicle keeps its row — the arrays stay rectangular, because a
+ragged interface just has to be un-ragged again by every caller — but gets a
+zeroed observation, zero reward, no costs and no terminal flag, and is
+invisible to every other vehicle's sensors. **The learner drops those rows
+from its batch.** Its action is ignored, so a policy that keeps emitting one
+costs nothing.
+
+Each agent also has its own episode clock, so a timeout retires one vehicle
+rather than resetting the fleet together.
+
+`n_agents` is therefore an upper bound on density, not the density. With the
+scripted driver's crash rate the mean on-road count sits around 11-16 out of
+20; a policy that crashes less will sit nearer the cap. Set `n_agents`
+higher than the density you want, or pass `initial_active=1.0,
+arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
+
 ```bash
-python test_envs.py                        # 18 checks, run after any change
+python test_envs.py                        # 20 checks, run after any change
 python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
 python -m envs.render3d manhattan          # manhattan_3d.png — 3D, offscreen
@@ -333,11 +359,9 @@ the lane constraints are worth as a result.
 - **No traffic lights, right-of-way rules, or pedestrians.** The scenarios
   are collision-prone by geometry, which is enough for the constraints to
   bite; signals would add a discrete state to the observation space.
-- **No staggered spawning.** All vehicles spawn at reset and respawn the
-  instant they finish. The spec wants arrivals spread over time so conflicts
-  emerge; that needs a spawn queue and a per-agent active flag.
-- **No pedestrians, no per-episode layout variation.** Both agreed as
-  wanted; neither is built.
+- **No pedestrians or other moving non-vehicles.** Dropped from scope.
+- **No per-episode layout variation.** Road closures and blocked lanes are
+  fixed per scenario, so a policy can still memorise one map.
 - **No metrics recorder and no learner-facing adapter.** `info` emits
   per-step costs; nothing aggregates them per episode, and `step` takes and
   returns lists rather than the shape SB3 or PettingZoo expects.

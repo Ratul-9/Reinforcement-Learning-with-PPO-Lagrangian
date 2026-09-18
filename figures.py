@@ -39,7 +39,7 @@ def render_one(scenario: str) -> None:
     for _ in range(SETTLE_STEPS):
         obs, *_ = env.step([pure_pursuit(o) for o in obs])
 
-    rects, goals = env._rects(), env._goals
+    rects, goals = env.vehicle_rects(), env._goals[env._active]
     render_mpl.draw(env.world, vehicles=rects, goals=goals,
                     path=f"{OUT}/{scenario}_plan.png")
 
@@ -47,7 +47,8 @@ def render_one(scenario: str) -> None:
     renderer.frame(rects, camera="orbit", path=f"{OUT}/{scenario}_aerial.png")
     # Frame the ego on whichever vehicle is actually moving, so the driver's
     # view is of a road being driven rather than of the inside of a bay.
-    ego = max(range(len(env.vehicles)), key=lambda i: abs(env.vehicles[i].vx))
+    live = [v for v, on in zip(env.vehicles, env._active) if on]
+    ego = max(range(len(live)), key=lambda i: abs(live[i].vx))
     renderer.frame(rects, ego=ego, camera="chase", path=f"{OUT}/{scenario}_chase.png")
     renderer.frame(rects, ego=ego, camera="ego", path=f"{OUT}/{scenario}_driver.png")
     renderer.close()

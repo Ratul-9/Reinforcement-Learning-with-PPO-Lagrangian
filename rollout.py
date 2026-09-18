@@ -74,11 +74,16 @@ def run(scenario: str, n_agents: int = 20, steps: int = 900, seed: int = 0,
 
     totals = {k: 0.0 for k in COST_CHANNELS}
     goals = collisions = episodes = 0
+    # Costs are averaged over ACTIVE agent-steps, not over the rectangular
+    # array: a vehicle waiting to arrive contributes a zero to every channel
+    # and would silently deflate every mean in the table.
+    live_steps = 0
     every = max(steps // frames, 1) if frames else 0
 
     for step in range(steps):
         obs, _reward, terminated, _truncated, info = env.step(
             [pure_pursuit(o) for o in obs])
+        live_steps += int(info["active"].sum())
         for k in COST_CHANNELS:
             totals[k] += float(info["cost"][k].sum())
         for event in info["events"]:
@@ -89,15 +94,15 @@ def run(scenario: str, n_agents: int = 20, steps: int = 900, seed: int = 0,
             if event:
                 episodes += 1
         if renderer and step % every == 0:
-            renderer.frame(env._rects(), camera="chase",
+            renderer.frame(env.vehicle_rects(), camera="chase",
                            path=f"rollout_{scenario}_{step:04d}.png")
 
     if renderer:
         renderer.close()
-    agent_steps = steps * n_agents
+    live_steps = max(live_steps, 1)
     return {"scenario": scenario, "episodes": episodes, "goals": goals,
-            "collisions": collisions,
-            **{k: v / agent_steps for k, v in totals.items()}}
+            "collisions": collisions, "active": live_steps / steps,
+            **{k: v / live_steps for k, v in totals.items()}}
 
 
 def main() -> None:
@@ -111,17 +116,18 @@ def main() -> None:
     args = ap.parse_args()
 
     kinds = [args.scenario] if args.scenario else list(road_network.SCENARIO_KINDS)
-    head = f"{'scenario':18s} {'episodes':>8s} {'goals':>6s} {'crashes':>8s}  " + \
-           "  ".join(f"{k:>9s}" for k in COST_CHANNELS)
+    head = f"{'scenario':18s} {'episodes':>8s} {'goals':>6s} {'crashes':>8s} " \
+           f"{'active':>7s}  " + "  ".join(f"{k:>9s}" for k in COST_CHANNELS)
     print(head)
     print("-" * len(head))
     for kind in kinds:
         row = run(kind, args.agents, args.steps, args.seed, args.frames)
         print(f"{row['scenario']:18s} {row['episodes']:8d} {row['goals']:6d} "
-              f"{row['collisions']:8d}  " +
+              f"{row['collisions']:8d} {row['active']:7.1f}  " +
               "  ".join(f"{row[k]:9.4f}" for k in COST_CHANNELS))
-    print("\ncost columns are per agent-step. goals+crashes < episodes means "
-          "the rest timed out.")
+    print("\ncost columns are per ACTIVE agent-step; `active` is the mean "
+          "number of vehicles on the road.\ngoals+crashes < episodes means the "
+          "rest timed out.")
 
 
 if __name__ == "__main__":

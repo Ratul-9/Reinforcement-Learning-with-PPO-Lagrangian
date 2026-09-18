@@ -28,6 +28,14 @@ def bare(kind="cross", seed=0):
                        scenery_density=0.0, bays=False)
 
 
+ALL_ON = dict(initial_active=1.0, arrival_spread=0.0, respawn_delay=0.0)
+"""Every vehicle on the road at reset and back instantly after it finishes.
+
+Staggered arrivals are the default and are what a training run wants, but a
+test that provokes one specific cost on one specific vehicle cannot also be
+waiting to find out whether that vehicle exists yet."""
+
+
 def drive(throttle=0.6, steering=0.0, brake=0.0, gear=3):
     return {"steering": np.array([steering], dtype=np.float32),
             "throttle": np.array([throttle], dtype=np.float32),
@@ -91,7 +99,7 @@ def test_overlap_tests():
 def test_offroad_cost_fires():
     """Drive straight off the side of the road and the off-road cost must
     charge, then the episode must end once the grace window is used up."""
-    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
     env.reset()
     veh = env.vehicles[0]
     # Point it across the carriageway rather than along it.
@@ -110,7 +118,7 @@ def test_offroad_cost_fires():
 
 def test_collision_cost_fires():
     """Two vehicles placed nose to nose must register a collision."""
-    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare())
+    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare(), **ALL_ON)
     env.reset()
     a, b = env.vehicles
     b.x, b.y, b.heading = a.x + 1.0, a.y, a.heading
@@ -121,7 +129,7 @@ def test_collision_cost_fires():
 
 def test_progress_reward_is_signed_by_direction():
     """Driving along the route must pay; driving away from it must not."""
-    env = TrafficEnv("cross", n_agents=1, seed=2, world=bare(seed=2))
+    env = TrafficEnv("cross", n_agents=1, seed=2, world=bare(seed=2), **ALL_ON)
     env.reset()
     veh = env.vehicles[0]
     goal = tuple(env._goals[0])
@@ -192,10 +200,13 @@ def test_spawns_are_lane_centred_and_right_way():
     from envs.traffic_env import TrafficEnv as Env
 
     for kind in road_network.SCENARIO_KINDS:
-        env = Env(kind, n_agents=20, seed=0)
+        env = Env(kind, n_agents=20, seed=0, **ALL_ON)
         _, info = env.reset()
         assert info["cost"]["collision"].sum() == 0.0, f"{kind} spawns in collision"
-        for veh in env.vehicles:
+        assert info["active"].any(), f"{kind} put nobody on the road"
+        for veh, live in zip(env.vehicles, info["active"]):
+            if not live:
+                continue
             fix = env.world.locate_lane(veh.x, veh.y, veh.heading)
             assert not fix.wrong_way, f"{kind} spawns against the traffic"
             assert abs(fix.offset) < 0.5, f"{kind} spawns off its lane centre"
@@ -207,7 +218,7 @@ def test_wrong_way_cost_fires():
     mistakes and each gets its own multiplier."""
     from envs.traffic_env import TrafficEnv as Env
 
-    env = Env("cross", n_agents=1, seed=0, world=bare())
+    env = Env("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
     env.reset()
     veh = env.vehicles[0]
     veh.heading += math.pi                       # same lane, facing back
@@ -221,7 +232,7 @@ def test_lane_keep_cost_fires():
     lane-keeping cost must charge and grow with the error."""
     from envs.traffic_env import TrafficEnv as Env
 
-    env = Env("cross", n_agents=1, seed=0, world=bare())
+    env = Env("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
     env.reset()
     veh = env.vehicles[0]
     fix = env.world.locate_lane(veh.x, veh.y, veh.heading)
@@ -248,7 +259,7 @@ def test_speeding_cost_fires():
     """Over the limit must charge, and charge more the further over."""
     from envs.traffic_env import SPEED_LIMIT
 
-    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
     env.reset()
     veh = env.vehicles[0]
     charged = []
@@ -263,7 +274,7 @@ def test_speeding_cost_fires():
 def test_ttc_cost_fires():
     """Closing head-on with a stationary vehicle must charge the TTC cost,
     and charge more the closer the conflict is."""
-    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare())
+    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare(), **ALL_ON)
     env.reset()
     a, b = env.vehicles
     charged = []
@@ -280,7 +291,7 @@ def test_ttc_cost_fires():
 
 def test_jerk_cost_fires():
     """A hard throttle-to-brake reversal must charge the comfort cost."""
-    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare())
+    env = TrafficEnv("cross", n_agents=1, seed=0, world=bare(), **ALL_ON)
     env.reset()
     env.vehicles[0].vx = 8.0
     charged = 0.0
@@ -289,6 +300,45 @@ def test_jerk_cost_fires():
         _, _, _, _, info = env.step([action])
         charged = max(charged, float(info["cost"]["jerk"][0]))
     assert charged > 0.0, "jerk cost never fired on a throttle-brake reversal"
+
+
+def test_arrivals_are_staggered():
+    """Vehicles must trickle in rather than all appearing at reset, and a
+    waiting vehicle must be inert: no reward, no cost, no terminal flag, and
+    invisible to everyone else's sensors."""
+    env = TrafficEnv("manhattan", n_agents=20, seed=0,
+                     initial_active=0.5, arrival_spread=20.0)
+    obs, info = env.reset()
+    at_reset = int(info["active"].sum())
+    assert 8 <= at_reset <= 12, f"{at_reset} active at reset, expected about half"
+
+    seen = {at_reset}
+    for _ in range(300):
+        obs, rew, term, trunc, info = env.step(
+            [env.action_space.sample() for _ in range(20)])
+        live = info["active"]
+        seen.add(int(live.sum()))
+        idle = ~live
+        assert not np.any(np.array(rew)[idle]), "a parked vehicle earned reward"
+        assert not np.any(np.array(term)[idle]), "a parked vehicle terminated"
+        for channel in info["cost"].values():
+            assert not np.any(channel[idle]), "a parked vehicle was charged"
+        for i in np.flatnonzero(idle):
+            assert obs[i]["state"].sum() == 0.0, "a parked vehicle observed itself"
+
+    assert max(seen) > at_reset, "nobody ever arrived after reset"
+    # Parked vehicles must not be visible to the ones that are driving: they
+    # are held far outside the world, and a lidar that could see them would
+    # be reporting a wall where there is none.
+    driving = np.flatnonzero(info["active"])
+    assert obs[driving[0]]["lidar"].max() <= 100.0
+
+
+def test_all_on_mode_disables_staggering():
+    """The knob the tests and any fixed-density experiment rely on."""
+    env = TrafficEnv("cross", n_agents=6, seed=0, world=bare(), **ALL_ON)
+    _, info = env.reset()
+    assert info["active"].all(), "initial_active=1.0 left someone waiting"
 
 
 def test_png_round_trip():
@@ -322,7 +372,7 @@ def test_png_round_trip():
     ratio = loaded.net.total_length / world.net.total_length
     assert 0.7 < ratio < 1.2, f"road length changed by {ratio:.2f}x"
 
-    env = Env("intersection_x", n_agents=4, seed=0, world=loaded)
+    env = Env("intersection_x", n_agents=4, seed=0, world=loaded, **ALL_ON)
     env.reset()
     for _ in range(10):
         env.step([env.action_space.sample() for _ in range(4)])

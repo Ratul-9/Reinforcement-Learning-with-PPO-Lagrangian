@@ -55,6 +55,22 @@ GOAL_RADIUS = 6.0            # metres along the route
 MIN_ROUTE = 40.0             # a destination nearer than this is not a journey
 OFFROAD_GRACE = 1.5          # seconds off the road before the episode ends
 
+# -- arrivals -------------------------------------------------------------
+# Vehicles do not all appear at once. Spawning the full fleet at reset makes
+# every conflict in the run a consequence of one simultaneous placement:
+# the same cars meet at the same junctions at the same times, and a policy
+# can learn that schedule instead of learning to drive. Staggering arrivals
+# is what makes a conflict a property of the traffic rather than of the
+# reset.
+#
+# `initial_active` of the fleet is on the road at reset; the rest arrive
+# over the next `arrival_spread` seconds. After an episode ends the vehicle
+# waits a further Exponential(`respawn_delay`) before returning, which is
+# what keeps arrivals from re-synchronising into a convoy over a long run.
+ARRIVAL_SPREAD = 25.0
+RESPAWN_DELAY = 4.0
+INITIAL_ACTIVE = 0.5
+
 # -- observation shape ----------------------------------------------------
 LIDAR_RAYS = 120
 LIDAR_RANGE = 100.0
@@ -91,13 +107,19 @@ class TrafficEnv(gym.Env):
                  dt: float = 0.1, seed: int | None = None,
                  scenery_density: float = 1.0, vehicle_cls=Sedan,
                  max_seconds: float = MAX_EPISODE_SECONDS,
-                 world: World | None = None):
+                 world: World | None = None,
+                 arrival_spread: float = ARRIVAL_SPREAD,
+                 respawn_delay: float = RESPAWN_DELAY,
+                 initial_active: float = INITIAL_ACTIVE):
         super().__init__()
         self.rng = np.random.default_rng(seed)
         self.dt = float(dt)
         self.n_agents = int(n_agents)
         self.max_steps = int(max_seconds / self.dt)
         self.vehicle_cls = vehicle_cls
+        self.arrival_spread = float(arrival_spread)
+        self.respawn_delay = float(respawn_delay)
+        self.initial_active = float(initial_active)
 
         # `world` wins over `scenario` when given, which is how a map loaded
         # from a PNG (`envs.png_map.load`) is trained on: the env does not
@@ -136,36 +158,78 @@ class TrafficEnv(gym.Env):
         self._route_prev = np.ones(self.n_agents)
         self._offroad_for = np.zeros(self.n_agents)
         self._accel_prev = np.zeros(self.n_agents)
-        self._steps = 0
+        # Per-agent, not global. With staggered arrivals every vehicle is at
+        # a different point of its own episode, so one shared step counter
+        # would time all of them out together — re-synchronising exactly what
+        # the staggering is for.
+        self._age = np.zeros(self.n_agents, dtype=int)
+        self._active = np.zeros(self.n_agents, dtype=bool)
+        self._wait = np.zeros(self.n_agents)     # seconds until arrival
+        self._far = 0.0                          # where parked vehicles go
 
     # -- reset ------------------------------------------------------------
 
     def reset(self, *, seed: int | None = None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        self._steps = 0
         self._offroad_for[:] = 0.0
         self._accel_prev[:] = 0.0
-        # Park every vehicle far outside the world first. `_respawn` rejects
-        # spawns that overlap another vehicle, and vehicles still sitting at
-        # their constructor default would all be stacked on the origin and
-        # veto every candidate near it.
-        far = max(abs(c) for c in self.world.bounds()) + 500.0
-        for k, veh in enumerate(self.vehicles):
-            veh.x, veh.y, veh.heading = far + 10.0 * k, far, 0.0
-        for i in range(self.n_agents):
-            self._respawn(i)
-        return self._observations(), {"cost": self._zero_costs()}
+        self._age[:] = 0
+        self._active[:] = False
 
-    def _respawn(self, i: int) -> None:
+        # Park every vehicle far outside the world. This does double duty:
+        # `_respawn` rejects spawns that overlap another vehicle, and
+        # vehicles still at their constructor default would all be stacked on
+        # the origin and veto every candidate near it — AND it is where a
+        # vehicle waiting to arrive sits, so every geometry query (collision,
+        # lidar, radar) keeps working on the full rectangular array without
+        # any of them needing to know about the active mask.
+        self._far = max(abs(c) for c in self.world.bounds()) + 500.0
+        for k in range(self.n_agents):
+            self._park(k)
+
+        # Who is on the road at t=0, and when the rest turn up.
+        n_now = int(round(self.n_agents * np.clip(self.initial_active, 0.0, 1.0)))
+        order = self.rng.permutation(self.n_agents)
+        self._wait[:] = self.rng.uniform(0.0, self.arrival_spread, self.n_agents)
+        self._wait[order[:n_now]] = 0.0
+        for i in order[:n_now]:
+            self._arrive(int(i))
+
+        return self._observations(), {"cost": self._zero_costs(),
+                                      "active": self._active.copy()}
+
+    def _park(self, i: int) -> None:
+        """Take agent `i` off the road until its next arrival."""
+        veh = self.vehicles[i]
+        veh.x, veh.y, veh.heading = self._far + 10.0 * i, self._far, 0.0
+        veh.vx = veh.vy = veh.yaw_rate = 0.0
+        self._active[i] = False
+
+    def _arrive(self, i: int) -> bool:
+        """Try to put a waiting agent on the road. False when every candidate
+        start was blocked, in which case it waits one more step and retries —
+        a vehicle cannot be forced into a space another vehicle is in."""
+        if self._respawn(i):
+            self._active[i] = True
+            self._age[i] = 0
+            return True
+        self._park(i)
+        return False
+
+    def _respawn(self, i: int) -> bool:
         """Put agent `i` at a fresh start with a fresh destination.
 
-        Retried against the vehicles already placed: two agents spawned into
-        the same bay would register a collision on step zero, and a policy
-        cannot be charged for a cost it was handed. The first few attempts
-        use the scenario's declared sources; once those are taken the rest of
-        the traffic is placed anywhere on the network, because a layout
-        declaring two approaches still has to hold twenty vehicles.
+        Returns False when every attempt was blocked by another vehicle. The
+        caller leaves it parked and tries again next step rather than forcing
+        it in: with staggered arrivals there is always a later moment, and a
+        vehicle materialising inside another one is a collision cost the
+        policy was handed rather than earned.
+
+        The first few attempts use the scenario's declared sources; once
+        those are taken the rest of the traffic is placed anywhere on the
+        network, because a layout declaring two approaches still has to hold
+        twenty vehicles.
 
         The destination is drawn and the pose snapped to its lane INSIDE the
         retry loop, not after it. Which lane a spawn belongs in depends on
@@ -177,6 +241,7 @@ class TrafficEnv(gym.Env):
         """
         veh = self.vehicles[i]
         others = np.delete(self._rects(), i, axis=0)
+        placed = False
         for attempt in range(24):
             x, y, heading = self.world.sample_start(self.rng, declared=attempt < 6)
             gx, gy, route = self.world.sample_goal(self.rng, (x, y), MIN_ROUTE)
@@ -189,7 +254,10 @@ class TrafficEnv(gym.Env):
             # measured against, so a pose that was placed correctly on the
             # approach can read as wrong-way on the ring.
             if clear and not self.world.locate_lane(x, y, heading).wrong_way:
+                placed = True
                 break
+        if not placed:
+            return False
 
         veh.reset(spawn_point=(x, y), destination=(gx, gy))
         veh.heading = heading
@@ -199,6 +267,7 @@ class TrafficEnv(gym.Env):
         self._route_prev[i] = route
         self._offroad_for[i] = 0.0
         self._accel_prev[i] = 0.0
+        return True
 
     def _snap_to_lane(self, x: float, y: float, goal, fallback: float):
         """Move a spawn into the right-hand lane of the direction its route
@@ -234,6 +303,12 @@ class TrafficEnv(gym.Env):
         return np.array([(v.x, v.y, self.half_length, self.half_width, v.heading)
                          for v in self.vehicles], dtype=float)
 
+    def vehicle_rects(self) -> np.ndarray:
+        """Footprints of the vehicles actually ON the road — what a renderer
+        wants. `_rects` keeps a row per agent, including the ones parked far
+        outside the world, because the geometry queries index by agent."""
+        return self._rects()[self._active]
+
     def _moving(self) -> np.ndarray:
         """(n_agents, 4) world x, y, vx, vy — what radar reads."""
         out = np.zeros((self.n_agents, 4))
@@ -249,14 +324,24 @@ class TrafficEnv(gym.Env):
     def step(self, actions):
         """One control step for every agent. `actions` is a sequence of
         `n_agents` action dicts; everything returned is a list of the same
-        length, plus `info["cost"]` — a dict of (n_agents,) cost arrays."""
+        length, plus `info["cost"]` — a dict of (n_agents,) cost arrays — and
+        `info["active"]`, a boolean mask.
+
+        The arrays stay rectangular whether or not a vehicle is on the road,
+        because a ragged interface would have to be un-ragged again by every
+        caller. A waiting vehicle gets a zeroed observation, zero reward, no
+        costs and no terminal flag; `info["active"]` says which rows those
+        are, and the learner drops them from its batch. Its action is
+        ignored, so a policy that keeps producing one costs nothing.
+        """
         if len(actions) != self.n_agents:
             raise ValueError(f"expected {self.n_agents} actions, got {len(actions)}")
 
         speed_before = np.array([v.vx for v in self.vehicles])
-        for veh, action in zip(self.vehicles, actions):
-            veh.step(action)
-        self._steps += 1
+        for veh, action, live in zip(self.vehicles, actions, self._active):
+            if live:
+                veh.step(action)
+        self._age[self._active] += 1
 
         rects = self._rects()
         moving = self._moving()
@@ -267,6 +352,9 @@ class TrafficEnv(gym.Env):
         events = []
 
         for i, veh in enumerate(self.vehicles):
+            if not self._active[i]:
+                events.append("")
+                continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
             route = self.world.net.route_distance((veh.x, veh.y), tuple(self._goals[i]))
 
@@ -331,21 +419,28 @@ class TrafficEnv(gym.Env):
 
             events.append(event)
 
-        if self._steps >= self.max_steps:
-            truncated[:] = True
+        truncated = self._active & (self._age >= self.max_steps)
 
         obs = self._observations()
-        info = {"cost": costs, "events": events,
+        info = {"cost": costs, "events": events, "active": self._active.copy(),
                 "route": self._route_prev.copy()}
 
-        # Respawn whatever finished, so density stays constant. Done AFTER
-        # the observation is taken: the learner's last observation of an
-        # episode must be the state the terminal flag refers to.
+        # Retire whatever finished. Done AFTER the observation is taken: the
+        # learner's last observation of an episode must be the state the
+        # terminal flag refers to.
         for i in range(self.n_agents):
             if terminated[i] or truncated[i]:
-                self._respawn(i)
-        if truncated.any():
-            self._steps = 0
+                self._park(i)
+                self._wait[i] = self.rng.exponential(self.respawn_delay)
+
+        # Then bring in whoever is due. An Exponential wait re-rolled on every
+        # retirement is what stops arrivals settling into a convoy: a fixed
+        # delay would have the whole fleet keep whatever spacing the first
+        # round of collisions happened to give it.
+        for i in np.flatnonzero(~self._active):
+            self._wait[i] -= self.dt
+            if self._wait[i] <= 0.0:
+                self._arrive(int(i))
 
         return obs, list(rewards), list(terminated), list(truncated), info
 
@@ -387,6 +482,13 @@ class TrafficEnv(gym.Env):
         static_boxes = self.world.static_boxes
         out = []
         for i, veh in enumerate(self.vehicles):
+            if not self._active[i]:
+                # A zeroed observation, not a computed one. A waiting vehicle
+                # is parked far outside the world, so its lidar would be 120
+                # rays of max_range and its route a straight line across
+                # empty space — the expensive way to compute nothing.
+                out.append(self._blank_observation())
+                continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
             goal = tuple(self._goals[i])
             (near, far), route = self.world.route_probe(
@@ -427,6 +529,16 @@ class TrafficEnv(gym.Env):
         return out
 
     @staticmethod
+    def _blank_observation() -> dict:
+        """The observation of a vehicle that is not on the road. Zeros, and
+        the lidar at full range — the shape the space promises, carrying no
+        claim about a world this vehicle is not in."""
+        return {"state": np.zeros(10, dtype=np.float32),
+                "navigation": np.zeros(6, dtype=np.float32),
+                "lidar": np.full(LIDAR_RAYS, LIDAR_RANGE, dtype=np.float32),
+                "radar": np.zeros((RADAR_OBJECTS, 4), dtype=np.float32)}
+
+    @staticmethod
     def _to_ego(veh, point) -> tuple[float, float]:
         """A world point as (forward, left) in the vehicle's own frame."""
         dx = point[0] - veh.x
@@ -440,5 +552,5 @@ class TrafficEnv(gym.Env):
         """Top-down PNG of the world and every vehicle in it. The 3D view
         lives in `envs/render3d.py` and takes the same World."""
         from envs import render_mpl
-        return render_mpl.draw(self.world, vehicles=self._rects(),
-                               goals=self._goals, path=path)
+        return render_mpl.draw(self.world, vehicles=self.vehicle_rects(),
+                               goals=self._goals[self._active], path=path)
