@@ -451,6 +451,66 @@ def test_batch_obs_round_trips():
     assert np.array_equal(batched["state"][2], obs[2]["state"])
 
 
+def test_ttc_reports_imminent_conflicts():
+    """The surrogate must report the dangerous cases, not just the tidy ones.
+
+    A stationary vehicle three metres ahead used to come back as `inf`: with
+    the pair already inside the conflict disc the quadratic's near root goes
+    negative, and filtering to positive roots threw away exactly the
+    geometry that matters. A separating pair must still be `inf` rather than
+    the time it would have met travelling the other way.
+    """
+    env = TrafficEnv("cross", n_agents=2, seed=0, world=bare(), **ALL_ON)
+    env.reset()
+    a, b = env.vehicles
+
+    def ttc(gap, lead_speed):
+        a.vx = 10.0
+        b.heading, b.vx = a.heading, lead_speed
+        b.x = a.x + math.cos(a.heading) * gap
+        b.y = a.y + math.sin(a.heading) * gap
+        return env._time_to_collision(0, env._moving())
+
+    assert ttc(3.0, 0.0) == 0.0, "missed a stationary vehicle three metres ahead"
+    assert ttc(30.0, 15.0) == math.inf, "charged for a vehicle pulling away"
+    assert ttc(30.0, 0.0) == math.inf or 2.0 < ttc(30.0, 0.0) < 3.0
+    near, far = ttc(20.0, 5.0), ttc(40.0, 5.0)
+    assert far > near > 0.0, f"not monotone in distance: {near}, {far}"
+
+
+def test_metrics_recorder():
+    """The recorder must close one episode per terminal flag and compare
+    realised cost against the budget the env reported."""
+    from envs.metrics import EpisodeRecorder
+
+    # The scripted driver, not random actions: a random gear is DRIVE one
+    # time in four, so a random fleet mostly sits still and no episode ever
+    # ends inside a short test.
+    from rollout import pure_pursuit
+
+    env = TrafficEnv("manhattan", n_agents=12, seed=1)
+    obs, _ = env.reset()
+    rec = EpisodeRecorder(dt=env.dt)
+    for _ in range(400):
+        obs, rew, term, trunc, info = env.step([pure_pursuit(o) for o in obs])
+        rec.update(info, term, trunc, rewards=rew)
+
+    assert rec.episodes, "no episodes closed in 40 seconds of traffic"
+    summary = rec.summary()
+    rates = sum(summary[f"rate_{name}"] for name in
+                ("goal", "collision_vehicle", "collision_static",
+                 "offroad", "timeout"))
+    assert abs(rates - 1.0) < 1e-9, f"outcomes do not partition: {rates}"
+
+    rows = rec.constraints()
+    assert rows, "no constraint rows"
+    for row in rows:
+        assert row["channel"] in COST_CHANNELS
+        assert row["cost"] >= 0.0
+        assert row["budget"] > 0.0, "budget did not reach the recorder"
+    assert "episodes" in rec.report()
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be

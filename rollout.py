@@ -29,6 +29,7 @@ import math
 import numpy as np
 
 from envs import road_network
+from envs.metrics import EpisodeRecorder
 from envs.traffic_env import TrafficEnv, COST_CHANNELS
 
 TARGET_SPEED = 7.0        # m/s — brisk for a town, slow enough to take a bend
@@ -68,7 +69,7 @@ def pure_pursuit(obs) -> dict:
 
 
 def run(scenario: str, n_agents: int = 20, steps: int = 900, seed: int = 0,
-        frames: int = 0) -> dict:
+        frames: int = 0, recorder: EpisodeRecorder | None = None) -> dict:
     """One rollout. Returns the summary row printed by `main`."""
     env = TrafficEnv(scenario, n_agents=n_agents, seed=seed)
     obs, _ = env.reset()
@@ -87,8 +88,10 @@ def run(scenario: str, n_agents: int = 20, steps: int = 900, seed: int = 0,
     every = max(steps // frames, 1) if frames else 0
 
     for step in range(steps):
-        obs, _reward, terminated, _truncated, info = env.step(
+        obs, reward, terminated, truncated, info = env.step(
             [pure_pursuit(o) for o in obs])
+        if recorder is not None:
+            recorder.update(info, terminated, truncated, rewards=reward)
         live_steps += int(info["active"].sum())
         for k in COST_CHANNELS:
             totals[k] += float(info["cost"][k].sum())
@@ -119,21 +122,32 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0,
                     help="write this many chase-camera PNGs")
+    ap.add_argument("--metrics", metavar="PATH",
+                    help="write the per-episode CSV and the constraint "
+                         "table here (PATH.csv and PATH.json)")
     args = ap.parse_args()
 
     kinds = [args.scenario] if args.scenario else list(road_network.SCENARIO_KINDS)
+    recorder = EpisodeRecorder() if args.metrics else None
     head = f"{'scenario':18s} {'episodes':>8s} {'goals':>6s} {'crashes':>8s} " \
            f"{'active':>7s}  " + "  ".join(f"{k:>9s}" for k in COST_CHANNELS)
     print(head)
     print("-" * len(head))
     for kind in kinds:
-        row = run(kind, args.agents, args.steps, args.seed, args.frames)
+        row = run(kind, args.agents, args.steps, args.seed, args.frames,
+                  recorder=recorder)
         print(f"{row['scenario']:18s} {row['episodes']:8d} {row['goals']:6d} "
               f"{row['collisions']:8d} {row['active']:7.1f}  " +
               "  ".join(f"{row[k]:9.4f}" for k in COST_CHANNELS))
     print("\ncost columns are per ACTIVE agent-step; `active` is the mean "
           "number of vehicles on the road.\ngoals+crashes < episodes means the "
           "rest timed out.")
+    if recorder is not None:
+        print()
+        print(recorder.report())
+        print()
+        print("wrote", recorder.write_csv(args.metrics + ".csv"))
+        print("wrote", recorder.write_json(args.metrics + ".json"))
 
 
 if __name__ == "__main__":

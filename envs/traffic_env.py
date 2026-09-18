@@ -507,6 +507,11 @@ class TrafficEnv(gym.Env):
         rewards = np.zeros(self.n_agents, dtype=np.float32)
         terminated = np.zeros(self.n_agents, dtype=bool)
         truncated = np.zeros(self.n_agents, dtype=bool)
+        # Raw seconds, reported alongside the ramped `ttc` COST. The cost
+        # saturates at zero seconds and is clipped at the threshold, so it
+        # cannot be inverted back into a time — and the near-miss
+        # distribution the paper reports is a distribution over times.
+        ttc_raw = np.full(self.n_agents, np.inf)
         events = []
 
         for i, veh in enumerate(self.vehicles):
@@ -568,6 +573,7 @@ class TrafficEnv(gym.Env):
                 costs["lane_keep"][i] = _ramp(abs(fix.offset), slack)
 
             ttc = self._time_to_collision(i, moving)
+            ttc_raw[i] = ttc
             if ttc < TTC_THRESHOLD:
                 costs["ttc"][i] = 1.0 - ttc / TTC_THRESHOLD
 
@@ -589,7 +595,9 @@ class TrafficEnv(gym.Env):
         info = {"cost": costs, "events": events, "active": self._active.copy(),
                 "route": self._route_prev.copy(),
                 "vehicle_type": list(self.vehicle_types),
-                "budget": self._budget_obs.copy()}
+                "budget": self._budget_obs.copy(),
+                "ttc": ttc_raw,
+                "scenario": self.world.spec.get("kind", "?")}
 
         # Retire whatever finished. Done AFTER the observation is taken: the
         # learner's last observation of an episode must be the state the
@@ -617,23 +625,41 @@ class TrafficEnv(gym.Env):
     def _time_to_collision(self, i: int, moving: np.ndarray) -> float:
         """Seconds to the nearest constant-velocity closing conflict.
 
-        A straight-line extrapolation of both vehicles, treating each as a
-        disc of the body's own circumscribed radius. It is not a prediction —
-        neither vehicle will actually hold its velocity — but it is the
-        standard surrogate-safety measure, and as a COST it only has to be
-        monotone in danger, not accurate.
+        Each vehicle is a disc of its own circumradius and a pair conflicts
+        when the discs touch, so the radius is the SUM of the two — a
+        motorcycle passing a bus is a different clearance from two
+        motorcycles, and using the ego's size twice got both wrong.
+
+        Three cases, and the middle one was a bug worth naming. Already
+        overlapping is TTC zero, not "no solution": with the pair inside the
+        disc the quadratic's near root is negative, so filtering to positive
+        roots discarded exactly the most dangerous geometry and reported
+        `inf` for a stationary vehicle three metres ahead. Pairs that are
+        separating are skipped outright rather than solved for the moment
+        they would have met going the other way.
+
+        It is a surrogate, not a prediction — neither vehicle will hold its
+        velocity. As a COST it only has to be monotone in danger.
         """
-        r = math.hypot(self.half_length[i], self.half_width[i]) * 2.0
+        radii = np.hypot(self.half_length, self.half_width)
         rel_p = np.delete(moving[:, :2] - moving[i, :2], i, axis=0)
         rel_v = np.delete(moving[:, 2:] - moving[i, 2:], i, axis=0)
-        if len(rel_p) == 0:
+        reach = np.delete(radii + radii[i], i)
+        live = np.delete(self._active, i)
+        if not live.any():
             return math.inf
+        rel_p, rel_v, reach = rel_p[live], rel_v[live], reach[live]
+
+        gap = (rel_p * rel_p).sum(axis=1) - reach * reach
+        if (gap <= 0.0).any():
+            return 0.0
 
         a = (rel_v * rel_v).sum(axis=1)
         b = 2.0 * (rel_p * rel_v).sum(axis=1)
-        c = (rel_p * rel_p).sum(axis=1) - r * r
-        disc = b * b - 4.0 * a * c
-        ok = (a > 1e-6) & (disc > 0.0)
+        disc = b * b - 4.0 * a * gap
+        # b < 0 is the pair closing; without it a separating pair still has a
+        # positive root, being the time it would meet if it reversed.
+        ok = (b < 0.0) & (a > 1e-6) & (disc > 0.0)
         if not ok.any():
             return math.inf
         t = (-b[ok] - np.sqrt(disc[ok])) / (2.0 * a[ok])

@@ -21,6 +21,7 @@ envs/
   world.py          network + scenery + collision tests + heading conversion
   sensors.py        analytic lidar / radar against that geometry
   traffic_env.py    N vehicles, one world, reward and costs kept apart
+  metrics.py        per-episode statistics: the results table
   render_mpl.py     top-down PNG — audit sheet, rollout frames
   render3d.py       Panda3D 3D view, offscreen PNG, driver's-eye camera
   png_map.py        PNG map <-> World, both directions
@@ -80,7 +81,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 25 checks, run after any change
+python test_envs.py                        # 27 checks, run after any change
 python fleet.py                            # the vehicle table
 python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
@@ -389,6 +390,56 @@ performance cores should scale close to linearly.
 
 ---
 
+## Episode metrics
+
+`envs/metrics.py` turns per-step costs into the statistics the results
+section is made of. An episode is a per-agent span between terminal flags —
+with staggered arrivals every agent is at a different point of its own
+journey, so anything aggregating by step averages a bus three seconds in
+with a motorcycle ninety seconds in.
+
+```python
+from envs.metrics import EpisodeRecorder
+
+recorder = EpisodeRecorder(dt=env.dt)
+for ...:
+    obs, rew, term, trunc, info = env.step(actions)
+    recorder.update(info, term, trunc, rewards=rew)
+print(recorder.report())
+recorder.write_csv("run.csv")       # one row per episode
+recorder.write_json("run.json")     # summary + constraint table
+```
+
+```bash
+python rollout.py manhattan --metrics run   # writes run.csv and run.json
+```
+
+It reports goal / collision / off-road / timeout rates (which partition —
+timeout is neither success nor failure), time-to-goal over the episodes that
+*reached* the goal (averaging it over failures lets a policy improve the
+number by crashing sooner), the minimum-TTC distribution, and **realised
+cost against budget per channel per vehicle type**.
+
+That last table is the headline. The claim under test is that the
+constraint is actually met — `J_c` inside `d_i` at convergence — and a run
+whose collision rate looks good while its collision cost sits at three times
+its budget has not shown what the paper says it shows. Budgets are read from
+`info["budget"]`, so a per-type budget table is compared per type without
+the recorder knowing one exists.
+
+λ trajectories are deliberately absent: they belong to the optimiser, and a
+recorder that invented a place for them would be guessing at the update
+schedule. Pass them to `report(extra=...)`.
+
+Two caveats on reading the output from the *scripted* driver: it violates
+most budgets, because the budgets are calibrated for a trained policy and
+that driver has no collision avoidance; and its min-TTC median is 0.00 s
+because 39% of its episodes end in a collision, where TTC is zero by
+definition. Filter on `outcome` in the CSV for a near-miss distribution that
+excludes actual crashes.
+
+---
+
 ## 3D rendering
 
 `render3d.Renderer3D` extrudes the same `World`: road ribbons and junction
@@ -525,7 +576,10 @@ Direction of travel at each waypoint comes from the route itself (the step
 from the previous waypoint), not from the vehicle's heading, so the shift is
 still right on the far side of a junction the vehicle has not reached.
 
-Measured with the scripted driver, per active agent-step:
+Measured with the scripted driver, per active agent-step. (These figures
+predate the mixed fleet and the TTC fix below, and were taken on a
+sedan-only fleet; the *direction* of every column is what they are cited
+for, not the absolute values.)
 
 | | centreline | in-lane |
 |---|---|---|
@@ -551,9 +605,6 @@ conflict — so it keeps its dial.
 - **No pedestrians or other moving non-vehicles.** Dropped from scope.
 - **No per-episode layout variation.** Road closures and blocked lanes are
   fixed per scenario, so a policy can still memorise one map.
-- **No metrics recorder.** `info` emits per-step costs; nothing aggregates
-  them per episode into the collision-rate / goal-rate / min-TTC table the
-  results section needs.
 - **No SB3 or PettingZoo adapter.** `VecTrafficEnv` is the vectorised
   interface, but it is this project's shape, not either library's.
 - **No roll-over, leaning or articulated vehicles** (see The fleet, above).
