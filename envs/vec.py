@@ -69,17 +69,28 @@ _STEP = "step"
 
 
 def performance_cores() -> int:
-    """How many workers to run: performance cores, not logical CPUs.
+    """How many workers to run: cores that can actually do the work.
 
-    `os.cpu_count()` counts efficiency cores, and on a heterogeneous CPU
-    (every Apple Silicon machine, and increasingly Intel too) a worker
-    landing on one runs several times slower — so oversubscribing does not
-    just fail to help, it drags the whole batch down to the slowest worker
-    because the parent waits for all of them each step.
+    `os.cpu_count()` is wrong in two different directions, and both of them
+    cost real throughput because the parent waits for every worker each step
+    — so oversubscribing does not merely fail to help, it drags the whole
+    batch down to the slowest worker.
+
+    macOS: it counts efficiency cores, which run this workload several times
+    slower (measured: per-worker compute 2.1x longer at four workers on an
+    M4, 3.7x at eight).
+
+    Linux, which is where this will actually train: it counts
+    hyperthreads. Two threads on one physical core do not give two cores'
+    worth of numpy — they share the execution units this workload is
+    bottlenecked on — so a 32-vCPU cloud box usually means 16 real cores.
+    Cgroup CPU limits are honoured too, since a container is frequently
+    given a fraction of the machine it can see.
     """
     import os
     import subprocess
 
+    # macOS: performance cores only.
     try:
         out = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"],
                              capture_output=True, text=True, timeout=2)
@@ -88,7 +99,62 @@ def performance_cores() -> int:
             return n
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    return max(1, (os.cpu_count() or 2))
+
+    limit = _cgroup_cpu_limit()
+
+    # Linux: distinct physical cores, from the topology each CPU reports.
+    try:
+        cores = set()
+        for cpu in os.listdir("/sys/devices/system/cpu"):
+            path = f"/sys/devices/system/cpu/{cpu}/topology/core_id"
+            if not os.path.exists(path):
+                continue
+            with open(path) as handle:
+                core = handle.read().strip()
+            pkg_path = f"/sys/devices/system/cpu/{cpu}/topology/physical_package_id"
+            pkg = "0"
+            if os.path.exists(pkg_path):
+                with open(pkg_path) as handle:
+                    pkg = handle.read().strip()
+            cores.add((pkg, core))
+        if cores:
+            return max(1, min(len(cores), limit or len(cores)))
+    except OSError:
+        pass
+
+    count = os.cpu_count() or 2
+    return max(1, min(count, limit or count))
+
+
+def _cgroup_cpu_limit() -> int | None:
+    """CPUs this container is actually allowed, or None if unrestricted.
+
+    A cloud container commonly sees the host's whole CPU list while being
+    quota'd to a slice of it, and starting a worker per visible CPU then
+    just queues them against each other.
+    """
+    for path, splitter in (("/sys/fs/cgroup/cpu.max", None),
+                           ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "v1")):
+        try:
+            with open(path) as handle:
+                text = handle.read().strip()
+        except OSError:
+            continue
+        try:
+            if splitter is None:
+                quota, period = text.split()
+                if quota == "max":
+                    return None
+                return max(1, int(int(quota) / int(period)))
+            quota = int(text)
+            if quota <= 0:
+                return None
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as handle:
+                period = int(handle.read().strip())
+            return max(1, int(quota / period))
+        except (ValueError, OSError):
+            continue
+    return None
 
 
 def _worker(conn, scenario: str, seed: int, kwargs: dict) -> None:

@@ -1,0 +1,14 @@
+# Training-only dependencies. The env's step path pulls in NOTHING heavy —
+# verified: importing TrafficEnv, VecTrafficEnv and EpisodeRecorder loads no
+# panda3d, matplotlib, opencv, scikit-image or PIL.
+#
+# That matters on a headless cloud box: no OpenGL, no display, no system
+# packages. Install this rather than requirements.txt, which additionally
+# carries the renderers and the PNG-map tooling you only need locally.
+numpy
+scipy
+gymnasium
+
+# The learner. Pick the build that matches the box (CUDA wheel on a GPU pod).
+torch
+tensorboard
