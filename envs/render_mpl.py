@@ -30,6 +30,7 @@ BUILDING = "#8d8579"
 TREE = "#4a7c3f"
 ISLAND = "#4d7546"
 VEHICLE = "#d9822b"
+BLOCKAGE = "#8c2121"
 EGO = "#2b7fd9"
 GOAL = "#c43b3b"
 
@@ -86,6 +87,10 @@ def draw(world: World, vehicles=None, goals=None, path: str | None = None,
                                  edgecolor="#6f6960", lw=0.5, zorder=5))
     for cx, cy, r, _h in world.scenery.trees:
         ax.add_patch(Circle((cx, cy), r, color=TREE, zorder=5))
+
+    for cx, cy, hl, hw, yaw in world.blockages:
+        ax.add_patch(_rect_patch(cx, cy, hl, hw, yaw, facecolor=BLOCKAGE,
+                                 edgecolor="black", lw=0.5, zorder=6))
 
     if goals is not None:
         for gx, gy in np.asarray(goals).reshape(-1, 2):

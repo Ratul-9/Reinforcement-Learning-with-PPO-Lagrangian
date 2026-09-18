@@ -194,7 +194,8 @@ class TrafficEnv(gym.Env):
                  world: World | None = None,
                  arrival_spread: float = ARRIVAL_SPREAD,
                  respawn_delay: float = RESPAWN_DELAY,
-                 initial_active: float = INITIAL_ACTIVE):
+                 initial_active: float = INITIAL_ACTIVE,
+                 layout_jitter: float = 0.0, blockages: int = 0):
         super().__init__()
         self.rng = np.random.default_rng(seed)
         self.dt = float(dt)
@@ -203,13 +204,22 @@ class TrafficEnv(gym.Env):
         self.arrival_spread = float(arrival_spread)
         self.respawn_delay = float(respawn_delay)
         self.initial_active = float(initial_active)
+        # Layout variation. Applied at RESET and nowhere else — re-rolling
+        # the geometry while vehicles are driving on it would teleport them
+        # off the road. A trainer that never calls reset never varies.
+        self.layout_jitter = float(layout_jitter)
+        self.blockages = int(blockages)
+        self._scenario = scenario
+        self._scenery_density = scenery_density
+        self._fixed_world = world is not None
 
         # `world` wins over `scenario` when given, which is how a map loaded
         # from a PNG (`envs.png_map.load`) is trained on: the env does not
         # care where a World came from.
         self.world = world or World.build(
             scenario, rng=np.random.default_rng(seed),
-            scenery_density=scenery_density)
+            scenery_density=scenery_density,
+            jitter=self.layout_jitter, blockages=self.blockages)
 
         # The fleet. `vehicle_types` is a type name, a list of names (one
         # per agent, cycled), or a dict of name -> proportion.
@@ -328,6 +338,17 @@ class TrafficEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+
+        # A fresh layout per episode, when asked. A policy trained on one
+        # fixed map learns that map: where its junctions are, which way its
+        # roads run. Re-rolling the continuous dimensions and the stalled
+        # vehicles means the only transferable thing to learn is driving.
+        if not self._fixed_world and (self.layout_jitter > 0.0 or self.blockages):
+            self.world = World.build(
+                self._scenario, rng=self.rng,
+                scenery_density=self._scenery_density,
+                jitter=self.layout_jitter, blockages=self.blockages)
+
         self._offroad_for[:] = 0.0
         self._accel_filt[:] = 0.0
         self._age[:] = 0
@@ -403,7 +424,11 @@ class TrafficEnv(gym.Env):
             gx, gy, route = self.world.sample_goal(self.rng, (x, y), MIN_ROUTE)
             x, y, heading = self._snap_to_lane(x, y, (gx, gy), heading)
             rect = (x, y, self.half_length[i], self.half_width[i], heading)
-            clear = not self.world.rect_hits_rects(rect, others).any()
+            # Scenery as well as traffic: with stalled vehicles parked in
+            # live lanes, a spawn that only checks moving traffic can put a
+            # vehicle inside one.
+            clear = (not self.world.rect_hits_rects(rect, others).any()
+                     and not self.world.hits_scenery(rect))
             # Re-ask the lane graph rather than trusting the snap. Near a
             # junction — a roundabout entry especially — the piece whose edge
             # is nearest after the move is not always the piece the snap

@@ -46,9 +46,12 @@ def wrap_pi(a):
 
 class World:
     """One built scenario: `net` (geometry + routing) and `scenery` (static
-    objects). Rebuilt per scenario, not per episode — the road graph and the
-    buildings are the environment, and re-rolling them every reset would mean
-    the policy never sees the same junction twice."""
+    objects).
+
+    A World is immutable once built; varying the layout means building a new
+    one, which `TrafficEnv` does at `reset` when asked. It cannot be done
+    mid-run: moving the geometry under vehicles that are driving on it would
+    teleport them off the road."""
 
     def __init__(self, net, objects: scenery.Scenery, spec: dict):
         self.net = net
@@ -59,6 +62,11 @@ class World:
         # builders (or the PNG loader) knowing lanes exist.
         self.lanes = LaneGraph(net)
 
+        # Stalled vehicles blocking a lane, kept separately from the
+        # scenery they are concatenated into: the sensors want one array,
+        # and the renderers want to draw a broken-down car as a car rather
+        # than as a very small building.
+        self.blockages = np.zeros((0, 5), dtype=np.float32)
         # Buildings as (N, 5) for the raycast: cx, cy, hl, hw, yaw.
         self.static_boxes = objects.boxes[:, :5].astype(np.float32).copy()
         # Trees as (M, 3): cx, cy, r.
@@ -66,9 +74,17 @@ class World:
 
     # -- construction -----------------------------------------------------
 
+    # Spec fields that are CONTINUOUS geometry and may be jittered. Counts
+    # are excluded on purpose: changing `arms`, `rows`, `cols` or `lanes`
+    # changes a layout's topology, and the builders make assumptions about
+    # it that a random integer would quietly break. Stretching an arm cannot.
+    JITTERABLE = ("arm", "block", "radius", "straight", "ramp", "closure",
+                  "bay", "lane_width")
+
     @classmethod
     def build(cls, spec="cross", rng: np.random.Generator | None = None,
-              scenery_density: float = 1.0, bays: bool = True) -> "World":
+              scenery_density: float = 1.0, bays: bool = True,
+              jitter: float = 0.0, blockages: int = 0) -> "World":
         """Build from a road spec (a kind name like `"roundabout_yield"`, or a
         full spec dict). Scenery placement is seeded, so the same spec and the
         same seed give the same town every time.
@@ -80,6 +96,8 @@ class World:
         """
         if rng is None:
             rng = np.random.default_rng(0)
+        if jitter > 0.0:
+            spec = cls.jitter_spec(spec, rng, jitter)
         net = road_network.build(spec)
         if bays and net.spec.get("kind") != "parking_lot":
             from envs import bays as bays_mod
@@ -87,7 +105,75 @@ class World:
         objects = scenery.generate(net, rng, density=scenery_density)
         full = dict(net.spec)
         full["scenery_density"] = scenery_density
-        return cls(net, objects, full)
+        world = cls(net, objects, full)
+        if blockages:
+            world.add_blockages(rng, blockages)
+        return world
+
+    @classmethod
+    def jitter_spec(cls, spec, rng: np.random.Generator, amount: float) -> dict:
+        """A layout's continuous dimensions, randomised by +/- `amount`.
+
+        The point is that the policy cannot memorise one map. Re-rolling only
+        the scenery leaves the road graph identical, and a policy that has
+        learned "at this junction, turn" keeps its answer; stretching the
+        arms means the junction is somewhere else every time.
+        """
+        if isinstance(spec, str):
+            spec = {"kind": spec}
+        spec = dict(road_network.default_spec(spec.get("kind", "cross")), **spec)
+        for key in cls.JITTERABLE:
+            if key in spec:
+                scale = 1.0 + float(rng.uniform(-amount, amount))
+                spec[key] = float(spec[key]) * scale
+        return spec
+
+    def add_blockages(self, rng: np.random.Generator, count: int,
+                      length: float = 4.5, width: float = 1.8) -> int:
+        """Park `count` stalled vehicles in live lanes.
+
+        These are static obstacles ON the carriageway, so unlike a building
+        they sit on the route the agent was given — and the route does NOT
+        know about them, because routing is over centrelines. That is the
+        whole point: the policy has to leave its lane to get past, which is
+        a manoeuvre a fixed layout never asks for and which puts the lane
+        costs in genuine tension with the progress reward.
+
+        Only multi-lane pieces are used, so there is always somewhere to go
+        around; a blocked single-lane bay would just be an unreachable goal.
+        """
+        placed = 0
+        rows = []
+        for _ in range(count * 12):
+            if placed >= count:
+                break
+            i = int(rng.integers(len(self.net.pieces)))
+            piece = self.net.pieces[i]
+            if piece.lanes < 2 or piece.length < 30.0:
+                continue
+            s = float(rng.uniform(12.0, piece.length - 12.0))
+            lanes = self.lanes.lanes(i)
+            lane = lanes[int(rng.integers(len(lanes)))]
+            cx, cy = piece.point(s)
+            tx, ty = piece.tangent(s)
+            x = cx - ty * lane.offset
+            y = cy + tx * lane.offset
+            # Never in front of a bay or on an episode endpoint: a vehicle
+            # spawning nose-first into a stalled lorry is a collision it was
+            # handed rather than one it earned.
+            ends = [(ex, ey) for ex, ey, _ in self.net.sources] + list(self.net.goals)
+            if any(math.hypot(x - ex, y - ey) < 12.0 for ex, ey in ends):
+                continue
+            rows.append((x, y, length / 2.0, width / 2.0, math.atan2(ty, tx)))
+            placed += 1
+
+        if rows:
+            # Appended to the static boxes, so the lidar sees them and the
+            # collision test charges for them with no further plumbing.
+            self.blockages = np.array(rows, dtype=np.float32)
+            self.static_boxes = np.vstack([self.static_boxes, self.blockages])
+            self.spec["blockages"] = placed
+        return placed
 
     def __repr__(self) -> str:
         return (f"World(kind={self.spec.get('kind')!r}, "

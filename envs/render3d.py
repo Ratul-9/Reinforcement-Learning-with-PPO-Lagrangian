@@ -47,6 +47,7 @@ BUILDING = (0.62, 0.58, 0.52, 1.0)
 TRUNK = (0.33, 0.25, 0.18, 1.0)
 CANOPY = (0.22, 0.45, 0.20, 1.0)
 VEHICLE = (0.85, 0.51, 0.17, 1.0)
+BLOCKAGE = (0.55, 0.13, 0.13, 1.0)      # a stalled vehicle in the lane
 EGO = (0.17, 0.50, 0.85, 1.0)
 
 # Draw heights. The order is load-bearing rather than cosmetic: pads sit
@@ -219,6 +220,13 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
     for cx, cy, r in world.net.islands:
         islands.disc(cx, cy, r, ISLAND_Z, segs=48)
 
+    # Stalled vehicles, drawn at vehicle height so they read as an
+    # obstruction in the lane rather than as a very small building.
+    blocked = _Mesh("blockages", BLOCKAGE)
+    for cx, cy, hl, hw, yaw in world.blockages:
+        blocked.box(float(cx), float(cy), float(hl), float(hw), float(yaw),
+                    0.2, 1.45)
+
     buildings = _Mesh("buildings", BUILDING)
     for cx, cy, hl, hw, yaw, h in world.scenery.boxes:
         buildings.box(float(cx), float(cy), float(hl), float(hw), float(yaw),
@@ -233,7 +241,7 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
 
     for mesh, offset in ((ground, 0), (surface, 2), (pads, 4), (paint, 3),
                          (islands, 5), (buildings, 0), (trunks, 0),
-                         (canopies, 0)):
+                         (canopies, 0), (blocked, 0)):
         node = mesh.node()
         if node is not None:
             # A few centimetres of lift is below the depth buffer's

@@ -81,7 +81,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 27 checks, run after any change
+python test_envs.py                        # 29 checks, run after any change
 python fleet.py                            # the vehicle table
 python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
@@ -390,6 +390,44 @@ performance cores should scale close to linearly.
 
 ---
 
+## Layout variation
+
+A fixed map is a map a policy can memorise — where its junctions are, which
+way its roads run. Two knobs re-roll it, both applied **at `reset` and
+nowhere else**: moving geometry under vehicles that are driving on it would
+teleport them off the road, so a trainer that never calls `reset` never
+varies.
+
+```python
+TrafficEnv("manhattan", layout_jitter=0.15, blockages=5)
+```
+
+**`layout_jitter`** randomises the layout's *continuous* dimensions by
+±15% — arm lengths, block sizes, radii, ramp and closure lengths. Counts
+(`arms`, `rows`, `cols`, `lanes`) are deliberately excluded: those change a
+layout's topology, and the builders make assumptions about it that a random
+integer would quietly break. Stretching an arm cannot.
+
+**`blockages`** parks stalled vehicles in live lanes. These are the
+interesting ones, because **the route does not know about them** — routing
+is over centrelines — so the agent is steered straight into an obstruction
+and has to leave its lane to get past. That puts `lane_keep` and `wrong_way`
+in genuine tension with the progress reward, which is a conflict a fixed
+layout never produces. Only multi-lane pieces are used, and never within 12 m
+of a bay, so there is always a way round and nobody spawns nose-first into a
+lorry.
+
+A rebuild costs ~40 ms against a ~7.5 s episode, so the variation is 0.5%
+overhead. Measured over three episodes on manhattan with the scripted
+driver:
+
+| | goal | collision | offroad |
+|---|---|---|---|
+| fixed layout | 16.4% | 45.4% | 38.2% |
+| varied + 5 blockages | 20.8% | 49.5% | 29.7% |
+
+---
+
 ## Episode metrics
 
 `envs/metrics.py` turns per-step costs into the statistics the results
@@ -603,8 +641,6 @@ conflict — so it keeps its dial.
   are collision-prone by geometry, which is enough for the constraints to
   bite; signals would add a discrete state to the observation space.
 - **No pedestrians or other moving non-vehicles.** Dropped from scope.
-- **No per-episode layout variation.** Road closures and blocked lanes are
-  fixed per scenario, so a policy can still memorise one map.
 - **No SB3 or PettingZoo adapter.** `VecTrafficEnv` is the vectorised
   interface, but it is this project's shape, not either library's.
 - **No roll-over, leaning or articulated vehicles** (see The fleet, above).

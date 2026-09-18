@@ -511,6 +511,46 @@ def test_metrics_recorder():
     assert "episodes" in rec.report()
 
 
+def test_layout_varies_per_reset():
+    """Successive resets must give geometrically different maps, and a
+    policy-visible difference rather than just different scenery.
+
+    A fixed layout is a map a policy can memorise: where the junctions are,
+    which way the roads run. Re-rolling the continuous dimensions is what
+    leaves driving as the only transferable thing to learn.
+    """
+    env = TrafficEnv("manhattan", n_agents=8, seed=0,
+                     layout_jitter=0.15, blockages=4)
+    extents, blocked = set(), set()
+    for _ in range(4):
+        _, info = env.reset()
+        extents.add(round(env.world.net.extent(), 2))
+        blocked.add(tuple(np.round(env.world.blockages[:, 0], 2)))
+        assert info["cost"]["collision"].sum() == 0.0, "spawned into a blockage"
+        assert len(env.world.blockages) == 4
+    assert len(extents) == 4, f"layout repeated: {extents}"
+    assert len(blocked) == 4, "blockages landed in the same places"
+
+
+def test_blockages_are_on_the_road_and_seen():
+    """A stalled vehicle must sit ON the carriageway — that is what makes it
+    different from scenery — and must be visible to the lidar, because the
+    route will happily steer straight through it."""
+    world = World.build("manhattan", rng=np.random.default_rng(2),
+                        scenery_density=0.0, blockages=6)
+    assert len(world.blockages) == 6
+    for cx, cy, *_ in world.blockages:
+        assert world.net.is_on_road(float(cx), float(cy)), "blockage off the road"
+
+    # Cast from a few metres back along the same piece; something must be
+    # closer than open ground.
+    cx, cy, _hl, _hw, yaw = world.blockages[0]
+    origin = (float(cx) - math.cos(yaw) * 20.0, float(cy) - math.sin(yaw) * 20.0)
+    ranges = sensors.lidar(origin, float(yaw), world.static_boxes,
+                           world.static_circles, n_rays=72, max_range=100.0)
+    assert ranges.min() < 25.0, "lidar cannot see a stalled vehicle 20 m ahead"
+
+
 def test_png_round_trip():
     """A world saved as a classified PNG must load back as an equivalent
     world — same layout, same buildings, same endpoints — and must be
