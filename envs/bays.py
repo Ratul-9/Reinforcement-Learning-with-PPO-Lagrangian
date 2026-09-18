@@ -174,7 +174,21 @@ def _split(net: RoadNetwork, piece_index: int, s: float,
     if s < gap or s > piece.length - gap:
         return None
 
-    mid = net.add_node(*piece.point(s), kind="tee")
+    # Pad sized to the STUB, not auto-sized to the arterial.
+    #
+    # `finalize` gives any non-"end" node a pad of 1.45x the half-width of
+    # the widest road meeting it, which is right for a crossroads and very
+    # wrong here: a bay attachment is a one-lane stub joining a
+    # carriageway, and auto-sizing gave it a 5-7 m disc on a road 5.2 m
+    # wide. Twenty-two of those down one street read as scalloped blobs
+    # across the tarmac — and because `road_margin` counts a pad as
+    # drivable, they also inflated the drivable area past the kerb, so the
+    # off-road cost was wrong at every bay.
+    #
+    # The stub's own half-width sits inside the arterial's ribbon, so it
+    # adds no drivable area at all while still rounding the turn-in.
+    stub_pad = BAY_LANES * net.lane_width / 2.0
+    mid = net.add_node(*piece.point(s), kind="tee", pad=stub_pad)
     a, b = piece.node_a, piece.node_b
     lanes = piece.lanes
     net.pieces.pop(piece_index)
