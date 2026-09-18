@@ -96,6 +96,12 @@ policy cannot memorise a schedule or a map. Layout variation happens at
 `reset` **only** — moving geometry under driving vehicles would teleport
 them off the road.
 
+**Actuators lag and sensors are noisy, both on by default.** A policy
+trained against instant actuators and exact sensors learns to depend on
+both. Noise touches the observation only — costs and metrics are ground
+truth, because a constraint measured through a noisy sensor measures the
+sensor.
+
 **Things deliberately NOT modelled**, so nobody rebuilds them by accident:
 pedestrians and moving non-vehicles (dropped from scope by the user),
 traffic lights and right-of-way (the scenarios are collision-prone by
@@ -125,6 +131,16 @@ Worth knowing, because each was invisible until something specific was built.
   no branch. Bays are rebuilt from their marker dot instead.
 - **Panda3D back-face culling made every road invisible.** Winding order is
   load-bearing: a clockwise upward-facing quad is simply not drawn.
+- **Explicit Euler was unstable below 6.7 m/s** — and the friction clip hid
+  it, turning divergence into a limit cycle that read as noise. The tuktuk
+  oscillated ±1.16 rad/s for a constant steering input. Physics is now
+  sub-stepped ten times per control step. ~70% of the measured `jerk` cost
+  had been integration noise.
+- **The progress reward was farmable.** Re-solving the route every step gave
+  jumps of +255 m, worth more than arriving. The route is now solved once
+  per episode and walked, and reward is clamped to distance driven.
+- **The rear tyres used the front axle's load** — `Fz_r` computed, never
+  used, ~33% free rear grip.
 
 ---
 
@@ -145,7 +161,7 @@ avoidance, so its crashes are information, not a failure.
 
 ## Performance, and this laptop
 
-~2400 agent-steps/s on one core. `envs/vec.py` runs one env per worker
+~2000 agent-steps/s on one core. `envs/vec.py` runs one env per worker
 process; use `performance_cores()`, which reads macOS performance cores,
 Linux physical cores and cgroup quotas — `os.cpu_count()` is wrong in both
 directions and the parent waits for every worker each step.

@@ -78,6 +78,16 @@ class VehicleSpec:
     mu: float                # tyre friction coefficient
     leans: bool = False      # exempt from the roll-stability grip penalty
 
+    # -- actuators ---------------------------------------------------------
+    # Nothing on a vehicle responds instantly. A policy trained against
+    # instantaneous actuators learns to rely on a response no real vehicle
+    # has, and the gap shows up as exactly the high-frequency steering a
+    # real car cannot follow.
+    steer_rate_deg: float = 70.0   # deg/s at the ROAD wheel, not the rim
+    steer_tau: float = 0.10        # s, electric power steering lag
+    throttle_tau: float = 0.25     # s, torque build-up
+    brake_tau: float = 0.12        # s, hydraulic pressure build-up
+
     # -- derived ----------------------------------------------------------
 
     @property
@@ -142,6 +152,8 @@ TUKTUK = VehicleSpec(
     wheelbase=2.00, cg_fraction=0.35, track_width=1.15, cg_height=0.65,
     max_steer_deg=45.0, max_accel=1.5, max_brake=4.5, max_speed=15.0,
     drag_coef=0.44, frontal_area=1.90, mu=0.75,
+    # Handlebar steering: direct, quick, no power assistance to lag.
+    steer_rate_deg=90.0, steer_tau=0.06, throttle_tau=0.20, brake_tau=0.10,
 )
 
 MOTORCYCLE = VehicleSpec(
@@ -150,6 +162,7 @@ MOTORCYCLE = VehicleSpec(
     wheelbase=1.35, cg_fraction=0.48, track_width=0.30, cg_height=0.60,
     max_steer_deg=30.0, max_accel=4.0, max_brake=7.0, max_speed=33.0,
     drag_coef=0.60, frontal_area=0.70, mu=0.85, leans=True,
+    steer_rate_deg=120.0, steer_tau=0.05, throttle_tau=0.15, brake_tau=0.08,
 )
 
 TRUCK = VehicleSpec(
@@ -157,6 +170,11 @@ TRUCK = VehicleSpec(
     wheelbase=4.20, cg_fraction=0.35, track_width=2.00, cg_height=1.20,
     max_steer_deg=26.0, max_accel=1.2, max_brake=5.5, max_speed=28.0,
     drag_coef=0.80, frontal_area=6.50, mu=0.75,
+    # AIR brakes. The ~0.4 s it takes to build pressure through the lines is
+    # not a detail — it is a third of a second of full-speed travel before
+    # retardation starts, and it is why a lorry's stopping distance is not
+    # just its mass. Heavy steering is slow for the same reason.
+    steer_rate_deg=40.0, steer_tau=0.18, throttle_tau=0.40, brake_tau=0.40,
 )
 
 BUS = VehicleSpec(
@@ -167,6 +185,7 @@ BUS = VehicleSpec(
     wheelbase=6.00, cg_fraction=0.40, track_width=2.10, cg_height=1.40,
     max_steer_deg=35.0, max_accel=1.0, max_brake=5.0, max_speed=22.0,
     drag_coef=0.70, frontal_area=7.30, mu=0.75,
+    steer_rate_deg=35.0, steer_tau=0.20, throttle_tau=0.45, brake_tau=0.45,
 )
 
 FLEET = {spec.name: spec for spec in (SEDAN, TUKTUK, MOTORCYCLE, TRUCK, BUS)}
@@ -183,14 +202,14 @@ def describe() -> str:
     """One line per type — the table in this module's docstring, generated
     from the specs rather than copied, so it cannot go stale."""
     head = (f"{'type':12s} {'L x W':>13s} {'mass':>8s} {'turn r':>7s} "
-            f"{'roll':>6s} {'grip':>6s} {'top':>6s}")
+            f"{'roll':>6s} {'grip':>6s} {'top':>6s} {'brake lag':>10s}")
     rows = [head, "-" * len(head)]
     for spec in FLEET.values():
         rows.append(
             f"{spec.name:12s} {spec.length:6.2f} x {spec.width:4.2f} "
             f"{spec.mass:7.0f}kg {spec.turning_radius:6.1f}m "
             f"{spec.rollover_accel:5.1f} {spec.effective_mu:6.2f} "
-            f"{spec.max_speed * 3.6:5.0f}kmh")
+            f"{spec.max_speed * 3.6:5.0f}kmh {spec.brake_tau:9.2f}s")
     return "\n".join(rows)
 
 

@@ -84,7 +84,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 30 checks, run after any change
+python test_envs.py                        # 37 checks, run after any change
 python fleet.py                            # the vehicle table
 python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
@@ -214,6 +214,44 @@ manhattan, 24 agents, scripted driver:
 physically cannot hold a lane centre. That is the evidence for the loose bus
 budget, rather than an assertion about it.
 
+### Actuators lag, and the fleet separates on braking
+
+Nothing responds instantly. Steering carries a first-order lag *and* a rate
+limit — they bound different things, the lag being how fast assistance
+builds and the rate the ceiling on turning the wheel at all. Throttle and
+brake are first-order.
+
+The brake constant is where the fleet genuinely separates: 0.08 s on a
+motorcycle's disc against 0.45 s for a bus's air lines, which at 20 m/s is
+nine metres of travel before retardation even begins. Stopping distance from
+20 m/s: motorcycle 28.8 m, sedan 27.0 m, truck 42.8 m, bus 47.8 m — the car
+figure matches real braking distance from 72 km/h, and heavy vehicles land
+at the expected 1.5–2×.
+
+A policy trained against instantaneous actuators learns to depend on a
+response no real vehicle has; the symptom on hardware is high-frequency
+steering chatter. `Vehicle(actuator_lag=False)` disables it for ablations.
+
+### Sensors are noisy; costs are not
+
+`TrafficEnv(sensor_noise=1.0)` corrupts **the observation only**. Lidar gets
+range-proportional noise and occasional dropped rays; radar gets position
+and velocity error; the ego block gets localisation and heading error,
+because lane keeping against a map is limited by knowing where you are, not
+by steering.
+
+**Costs, terminations and metrics are computed from ground truth**, and a
+test pins it: two envs with the same seed and the same actions produce
+byte-identical costs at any noise level. If a cost were measured through a
+noisy sensor the budget would stop meaning what it says — "≤ 5 steps off the
+road" would become "≤ 5 steps the localiser *thought* were off the road".
+
+The `vehicle` and `budget` observation blocks are never corrupted: a vehicle
+knows its own mass and its own constraints exactly.
+
+`sensor_noise=0.0` turns it off. Measured cost with the scripted driver:
+1.4 points of goal rate, 3% throughput.
+
 ### What the vehicle model does not do
 
 **Roll-over.** A bus tips at about 7.4 m/s² lateral, below where its tyres
@@ -331,7 +369,9 @@ a depth buffer read back off a GPU. At 20–30 agents × 20 Hz that is the
 difference between a run that fits on a laptop and one that does not, and
 the answers are exact rather than quantised to a framebuffer.
 
-Measured: **~2300–2500 agent-steps/s** on one CPU core, all eight scenarios.
+Measured: **~2000 agent-steps/s** on one CPU core, all eight scenarios,
+with the physics sub-stepped ten times per control step and actuator lag
+and sensor noise both on.
 Two exact optimisations got it there from ~1150, neither changing an answer:
 
 - **Broad-phase road projection.** `_project_full` was the hottest call in
@@ -647,6 +687,12 @@ conflict — so it keeps its dial.
 - **No SB3 or PettingZoo adapter.** `VecTrafficEnv` is the vectorised
   interface, but it is this project's shape, not either library's.
 - **No roll-over, leaning or articulated vehicles** (see The fleet, above).
+- **Linear tyres.** No Pacejka curve and no combined slip, so grip is a
+  straight line into a clip rather than a peak that falls away past it.
+- **No load transfer or suspension.** Axle loads are static, so braking does
+  not shift weight forward and cornering does not unload the inside wheels.
+- **No road grade, banking or friction variation.** `step` takes a
+  `slope_angle` the env never sets; every surface is flat and equally grippy.
 - **Arcs are lost through a PNG round trip** (see above).
 - **No validation against real trajectory data.** `paper-idea.md` flags this
   as a Phase 5 deliverable, not an afterthought.

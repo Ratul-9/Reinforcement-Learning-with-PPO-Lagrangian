@@ -33,10 +33,13 @@ class Vehicle:
     existed.
     """
     def __init__(self, spawn_point=(0.0, 0.0), destination=(100.0, 100.0), dt=0.1,
-                 spec: VehicleSpec = SEDAN):
+                 spec: VehicleSpec = SEDAN, actuator_lag: bool = True):
         # Environment properties
         self.dt = dt
         self.spec = spec
+        # Actuators respond over time, not instantly. Off only for
+        # ablations and for tests that need one exact command applied.
+        self.actuator_lag = bool(actuator_lag)
         # See `step` for why this is 10 and not 1.
         self.substeps = PHYSICS_SUBSTEPS
         self.spawn_point = np.array(spawn_point, dtype=np.float32)
@@ -53,6 +56,10 @@ class Vehicle:
         self.yaw_rate = 0.0 # Angular velocity (rad/s)
         self.steering_angle = 0.0
         self.gear = Gear.PARK
+        # Actuator states: what the vehicle is ACTUALLY doing, as opposed to
+        # what it was last told to do.
+        self.throttle = 0.0
+        self.brake = 0.0
         
         # --- Physical Parameters, from the spec ---
         self.mass = spec.mass # kg
@@ -65,6 +72,10 @@ class Vehicle:
         self.width = spec.width
 
         self.max_steer_angle = np.radians(spec.max_steer_deg)
+        self.max_steer_rate = np.radians(spec.steer_rate_deg)
+        self.steer_tau = spec.steer_tau
+        self.throttle_tau = spec.throttle_tau
+        self.brake_tau = spec.brake_tau
         self.max_accel = spec.max_accel # m/s^2 (corresponds to engine force)
         self.max_brake = spec.max_brake # m/s^2
         self.max_speed = spec.max_speed # m/s, governed
@@ -142,6 +153,10 @@ class Vehicle:
         self.yaw_rate = 0.0
         self.steering_angle = 0.0
         self.gear = Gear.PARK
+        # Actuator states: what the vehicle is ACTUALLY doing, as opposed to
+        # what it was last told to do.
+        self.throttle = 0.0
+        self.brake = 0.0
         
         return self.get_observation()
         
@@ -160,7 +175,11 @@ class Vehicle:
         elif gear_input == 2: self.gear = Gear.NEUTRAL
         elif gear_input == 3: self.gear = Gear.DRIVE
             
-        self.steering_angle = steering_input * self.max_steer_angle
+        steer_target = steering_input * self.max_steer_angle
+        if not self.actuator_lag:
+            self.steering_angle = steer_target
+            self.throttle = throttle_input
+            self.brake = brake_input
 
         # Integrate the physics on a finer grid than the control period.
         #
@@ -179,9 +198,11 @@ class Vehicle:
         # kinematic fallback takes over, so the whole operating range is
         # stable. Forces are recomputed per sub-step because drag and
         # braking both depend on the speed being integrated.
+        sub = self.dt / self.substeps
         for _ in range(self.substeps):
-            self._advance(self.dt / self.substeps, throttle_input,
-                          brake_input, slope_angle)
+            if self.actuator_lag:
+                self._actuate(sub, steer_target, throttle_input, brake_input)
+            self._advance(sub, self.throttle, self.brake, slope_angle)
 
         # Governor and heading wrap apply once per control step, not per
         # sub-step: they are limits on the reported state, not forces.
@@ -189,6 +210,43 @@ class Vehicle:
         self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
 
         return self.get_observation(external_sensors)
+
+    def _actuate(self, dt, steer_target, throttle_target, brake_target):
+        """Move the actuators toward what they were commanded.
+
+        Nothing on a vehicle responds instantly, and a policy trained
+        against actuators that do will learn to depend on a response no real
+        vehicle has — the classic symptom being high-frequency steering
+        chatter that transfers to hardware as a shaking wheel.
+
+        Steering gets a RATE LIMIT as well as a lag, because the two
+        constrain different things: the lag is how long the assistance takes
+        to build, the rate is the hard ceiling on how fast the wheel can be
+        turned at all. A first-order lag alone still allows an arbitrarily
+        fast initial move.
+
+        Throttle and brake are first-order only. The brake constant is where
+        the fleet separates: 0.08 s on a motorcycle's disc against 0.45 s
+        for a bus's air lines, which at 20 m/s is nine metres of travel
+        before retardation even begins.
+        """
+        # Plain arithmetic rather than np.clip: this runs once per sub-step
+        # per agent, so ten times per control step, and numpy's dispatch
+        # overhead on a scalar dwarfs the work itself — it measured ~20% of
+        # total env throughput.
+        alpha = dt / (self.steer_tau + dt)
+        delta = alpha * (steer_target - self.steering_angle)
+        limit = self.max_steer_rate * dt
+        if delta > limit:
+            delta = limit
+        elif delta < -limit:
+            delta = -limit
+        self.steering_angle += delta
+
+        a_thr = dt / (self.throttle_tau + dt)
+        a_brk = dt / (self.brake_tau + dt)
+        self.throttle += a_thr * (throttle_target - self.throttle)
+        self.brake += a_brk * (brake_target - self.brake)
 
     def _advance(self, dt, throttle_input, brake_input, slope_angle):
         """One physics sub-step of length `dt`."""

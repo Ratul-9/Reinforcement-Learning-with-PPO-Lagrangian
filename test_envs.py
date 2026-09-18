@@ -710,6 +710,115 @@ def test_route_tracker_is_monotone():
     assert tracker.remaining() < 1.0, "walking the whole route did not finish it"
 
 
+def test_sensor_noise_does_not_reach_the_costs():
+    """Noise corrupts what the agent PERCEIVES, never what it is judged on.
+
+    If a cost were measured through a noisy sensor, the budget would stop
+    meaning what it says — `<= 5 steps off the road` would become `<= 5
+    steps the localiser THOUGHT were off the road`, and the constraint would
+    be measuring the sensor.
+
+    Two envs, same seed, same actions, different noise: every cost,
+    termination and reward must match exactly.
+    """
+    actions = None
+    runs = {}
+    for noise in (0.0, 1.0):
+        env = TrafficEnv("manhattan", n_agents=8, seed=4, sensor_noise=noise)
+        obs, _ = env.reset()
+        if actions is None:
+            rng = np.random.default_rng(0)
+            actions = [[{"steering": np.array([rng.uniform(-1, 1)], np.float32),
+                         "throttle": np.array([rng.uniform(0, 1)], np.float32),
+                         "brake": np.array([rng.uniform(0, 1)], np.float32),
+                         "gear": 3} for _ in range(8)] for _ in range(60)]
+        costs, rewards = [], []
+        for step_actions in actions:
+            _obs, reward, _t, _tr, info = env.step(step_actions)
+            costs.append({k: v.copy() for k, v in info["cost"].items()})
+            rewards.append(list(reward))
+        runs[noise] = (costs, rewards)
+
+    clean, noisy = runs[0.0], runs[1.0]
+    for step, (a, b) in enumerate(zip(clean[0], noisy[0])):
+        for channel in COST_CHANNELS:
+            assert np.array_equal(a[channel], b[channel]), \
+                f"sensor noise changed the {channel} cost at step {step}"
+    assert clean[1] == noisy[1], "sensor noise changed the reward"
+
+
+def test_sensor_noise_actually_perturbs():
+    """...and it must actually be doing something when switched on."""
+    env = TrafficEnv("manhattan", n_agents=8, seed=4, sensor_noise=1.0)
+    obs, _ = env.reset()
+    obs, _r, _t, _tr, info = env.step(
+        [env.action_space.sample() for _ in range(8)])
+    live = int(np.flatnonzero(info["active"])[0])
+
+    # The vehicle and budget blocks are known exactly and must be untouched.
+    from envs.budgets import as_vector
+    assert np.allclose(obs[live]["budget"],
+                       as_vector(info["vehicle_type"][live]))
+
+    quiet = TrafficEnv("manhattan", n_agents=8, seed=4, sensor_noise=0.0)
+    clean, _ = quiet.reset()
+    clean, *_ = quiet.step([quiet.action_space.sample() for _ in range(8)])
+    assert not np.array_equal(obs[live]["lidar"], clean[live]["lidar"]), \
+        "sensor_noise=1.0 produced an identical lidar scan"
+
+
+def test_actuators_lag_and_rate_limit():
+    """Steering must not teleport, and heavy vehicles must brake slowly.
+
+    A policy trained against instantaneous actuators learns to depend on a
+    response no real vehicle has; the symptom on hardware is high-frequency
+    steering chatter. Steering carries both a lag and a rate limit because
+    they bound different things — the lag is how fast assistance builds, the
+    rate is the ceiling on turning the wheel at all.
+    """
+    from vehicle import Vehicle, Gear
+    from fleet import FLEET
+
+    spec = FLEET["sedan"]
+    veh = Vehicle(spec=spec, dt=0.1)
+    veh.gear = Gear.DRIVE
+    veh.vx = 10.0
+    full = drive(throttle=0.0, steering=1.0)
+
+    veh.step(full)
+    first = abs(veh.steering_angle)
+    assert first < veh.max_steer_angle, "steering reached full lock in one step"
+    assert first <= veh.max_steer_rate * veh.dt + 1e-9, \
+        f"steering moved {math.degrees(first):.1f} deg in one step, " \
+        f"limit is {math.degrees(veh.max_steer_rate * veh.dt):.1f}"
+
+    for _ in range(40):
+        veh.step(full)
+    assert abs(veh.steering_angle) > 0.95 * veh.max_steer_angle, \
+        "steering never reached the commanded angle"
+
+    # Air brakes: the bus must need materially more road than the car.
+    def stopping_distance(name):
+        v = Vehicle(spec=FLEET[name], dt=0.1)
+        v.gear, v.vx, v.x = Gear.DRIVE, 20.0, 0.0
+        for _ in range(200):
+            v.step(drive(throttle=0.0, brake=1.0))
+            if v.vx <= 0.01:
+                break
+        return v.x
+
+    car, bus = stopping_distance("sedan"), stopping_distance("bus")
+    assert bus > car * 1.4, \
+        f"bus stops in {bus:.1f} m against the car's {car:.1f} — air brake " \
+        f"lag and mass are not showing up"
+
+    # And the ablation switch has to actually disable it.
+    instant = Vehicle(spec=spec, dt=0.1, actuator_lag=False)
+    instant.gear = Gear.DRIVE
+    instant.step(full)
+    assert abs(instant.steering_angle - instant.max_steer_angle) < 1e-9
+
+
 def test_contract_is_stable():
     """Pin the interface Handoff.md documents.
 

@@ -108,6 +108,27 @@ LOOKAHEAD_FAR = 18.0
 COST_CHANNELS = ("collision", "offroad", "wrong_way", "lane_keep",
                  "ttc", "jerk", "speeding")
 
+# -- sensor noise ---------------------------------------------------------
+# A policy trained on exact sensors learns to trust them exactly, and the
+# first thing it meets on hardware is a lidar return that is 3 cm out and a
+# lateral position estimate that is 10 cm out. The magnitudes below are
+# nominal for good automotive hardware; `sensor_noise` scales all of them,
+# and 0.0 turns the lot off for an ablation.
+#
+# CRITICAL: noise is applied to the OBSERVATION ONLY. Costs, terminations
+# and metrics are computed from ground truth. A constraint measured through
+# a noisy sensor is measuring the sensor, and the budget would stop meaning
+# what it says.
+LIDAR_SIGMA = 0.02           # m, constant term
+LIDAR_SIGMA_FRAC = 0.002     # m per m of range
+LIDAR_DROPOUT = 0.005        # fraction of rays returning no echo
+RADAR_SIGMA_POS = 0.25       # m
+RADAR_SIGMA_VEL = 0.15       # m/s
+LOCALISATION_SIGMA = 0.08    # m, lateral position estimate
+HEADING_SIGMA = 0.009        # rad, about half a degree
+SPEED_SIGMA = 0.05           # m/s
+YAW_RATE_SIGMA = 0.01        # rad/s
+
 # -- cost thresholds (what counts as a violation, NOT what it is worth) ---
 TTC_THRESHOLD = 2.0          # seconds; below this the TTC cost is charged
 SPEED_LIMIT = 13.9           # m/s (50 km/h)
@@ -196,7 +217,8 @@ class TrafficEnv(gym.Env):
                  arrival_spread: float = ARRIVAL_SPREAD,
                  respawn_delay: float = RESPAWN_DELAY,
                  initial_active: float = INITIAL_ACTIVE,
-                 layout_jitter: float = 0.0, blockages: int = 0):
+                 layout_jitter: float = 0.0, blockages: int = 0,
+                 sensor_noise: float = 1.0):
         super().__init__()
         self.rng = np.random.default_rng(seed)
         self.dt = float(dt)
@@ -208,6 +230,13 @@ class TrafficEnv(gym.Env):
         # Layout variation. Applied at RESET and nowhere else — re-rolling
         # the geometry while vehicles are driving on it would teleport them
         # off the road. A trainer that never calls reset never varies.
+        self.sensor_noise = float(sensor_noise)
+        # Its own generator, deliberately. Drawing sensor noise from the
+        # same stream as spawns would make an observation-noise ablation
+        # silently change where every vehicle starts, and the two runs would
+        # no longer be comparable.
+        self._noise_rng = np.random.default_rng(
+            None if seed is None else seed + 991)
         self.layout_jitter = float(layout_jitter)
         self.blockages = int(blockages)
         self._scenario = scenario
@@ -770,25 +799,68 @@ class TrafficEnv(gym.Env):
             n_lanes = len(self.world.lanes.lanes(fix.piece))
             lane_norm = fix.lane.index / max(n_lanes - 1, 1)
 
-            out.append({
-                "state": np.array([
+            state = np.array([
                     veh.vx, veh.vy, veh.yaw_rate, veh.steering_angle,
                     float(veh.gear.value), margin,
                     wrap_pi(veh.heading - tangent),
-                    fix.offset, lane_norm, float(fix.wrong_way),
-                ], dtype=np.float32),
-                "navigation": np.array([
-                    route, nf, nl, ff, fl, wrap_pi(bend - veh.heading),
-                ], dtype=np.float32),
+                fix.offset, lane_norm, float(fix.wrong_way),
+            ], dtype=np.float32)
+            navigation = np.array([
+                route, nf, nl, ff, fl, wrap_pi(bend - veh.heading),
+            ], dtype=np.float32)
+            radar = sensors.radar((veh.x, veh.y), veh.heading,
+                                  moving[i, 2:], np.delete(moving, i, axis=0),
+                                  max_objects=RADAR_OBJECTS,
+                                  max_range=LIDAR_RANGE)
+            if self.sensor_noise > 0.0:
+                state, navigation, ranges, radar = self._corrupt(
+                    state, navigation, ranges, radar)
+
+            out.append({
+                "state": state,
+                "navigation": navigation,
                 "lidar": ranges,
-                "radar": sensors.radar((veh.x, veh.y), veh.heading,
-                                       moving[i, 2:], np.delete(moving, i, axis=0),
-                                       max_objects=RADAR_OBJECTS,
-                                       max_range=LIDAR_RANGE),
+                "radar": radar,
                 "vehicle": self._vehicle_obs[i],
                 "budget": self._budget_obs[i],
             })
         return out
+
+    def _corrupt(self, state, navigation, ranges, radar):
+        """What the agent perceives, as opposed to what is true.
+
+        Range noise grows with distance, which is how a real lidar behaves,
+        and a few rays return nothing at all. The ego block gets
+        localisation and heading error because lane keeping against a map is
+        limited by knowing where you are, not by steering.
+
+        `vehicle` and `budget` are left alone: a vehicle knows its own mass
+        and its own constraints exactly.
+        """
+        rng = self._noise_rng
+        k = self.sensor_noise
+
+        state = state.copy()
+        state[0] += rng.normal(0.0, SPEED_SIGMA * k)          # vx
+        state[2] += rng.normal(0.0, YAW_RATE_SIGMA * k)       # yaw rate
+        state[6] += rng.normal(0.0, HEADING_SIGMA * k)        # heading error
+        state[7] += rng.normal(0.0, LOCALISATION_SIGMA * k)   # lane offset
+
+        navigation = navigation.copy()
+        navigation[1:5] += rng.normal(0.0, LOCALISATION_SIGMA * k, 4)
+
+        sigma = (LIDAR_SIGMA + LIDAR_SIGMA_FRAC * ranges) * k
+        ranges = ranges + rng.normal(0.0, 1.0, ranges.shape).astype(np.float32) * sigma
+        lost = rng.random(ranges.shape) < LIDAR_DROPOUT * k
+        ranges = np.clip(np.where(lost, LIDAR_RANGE, ranges),
+                         0.0, LIDAR_RANGE).astype(np.float32)
+
+        radar = radar.copy()
+        seen = np.any(radar != 0.0, axis=1)
+        if seen.any():
+            radar[seen, :2] += rng.normal(0.0, RADAR_SIGMA_POS * k, (seen.sum(), 2))
+            radar[seen, 2:] += rng.normal(0.0, RADAR_SIGMA_VEL * k, (seen.sum(), 2))
+        return state, navigation, ranges, radar.astype(np.float32)
 
     def _blank_observation(self, i: int) -> dict:
         """The observation of a vehicle that is not on the road. Zeros, and

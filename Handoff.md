@@ -182,6 +182,20 @@ Pass them via `report(extra=...)` or log them alongside.
 
 ---
 
+## Two knobs a baseline may want to turn off
+
+| argument | default | effect |
+|---|---|---|
+| `sensor_noise` | `1.0` | observation noise. `0.0` gives exact sensors |
+| `layout_jitter` | `0.0` | geometry re-rolled per reset |
+| `blockages` | `0` | stalled vehicles in live lanes |
+
+`Vehicle(actuator_lag=False)` removes steering/throttle/brake lag.
+
+Sensor noise **never** reaches the costs, terminations or metrics — those
+are ground truth. Same seed and same actions give identical costs at any
+noise level, and a test pins it.
+
 ## Known sharp edges
 
 - **Layout variation only happens at `reset`.** A trainer that never resets
