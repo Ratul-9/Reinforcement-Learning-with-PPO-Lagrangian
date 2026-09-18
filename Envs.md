@@ -26,7 +26,13 @@ envs/
   png_map.py        PNG map <-> World, both directions
 ```
 
-`vehicle.Sedan` supplies the physics. Nothing in `envs/` duplicates it.
+```
+fleet.py            physical parameters for the five vehicle types
+vehicle.py          the 4-wheel dynamic model, driven by a VehicleSpec
+envs/budgets.py     per-type cost budgets — the d_i in the Lagrangian
+```
+
+`vehicle.Vehicle` supplies the physics; nothing in `envs/` duplicates it.
 
 ---
 
@@ -75,6 +81,8 @@ arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
 python test_envs.py                        # 25 checks, run after any change
+python fleet.py                            # the vehicle table
+python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
 python rollout.py                          # scripted driver on all 8 scenarios
 python -m envs.render_mpl                  # scenarios.png — all eight, top down
@@ -137,6 +145,86 @@ carriageway or adds an arm without touching a builder:
 ```python
 World.build({"kind": "roundabout_yield", "radius": 28.0, "arms": 5, "lanes": 3})
 ```
+
+---
+
+## The fleet
+
+Five vehicle types, each earning its slot by changing the *conflict* rather
+than the paint. `python fleet.py` prints the table.
+
+| | L × W (m) | mass | turn radius | top speed |
+|---|---|---|---|---|
+| motorcycle | 2.00 × 0.75 | 180 kg | 2.3 m | 119 km/h |
+| tuktuk (auto rickshaw) | 2.63 × 1.30 | 450 kg | 2.0 m | 54 km/h |
+| sedan | 4.50 × 1.80 | 1500 kg | 4.0 m | 180 km/h |
+| truck | 7.50 × 2.40 | 5800 kg | 8.6 m | 101 km/h |
+| bus | 12.20 × 2.55 | 12000 kg | 8.6 m | 79 km/h |
+
+One set of equations; what differs is the `VehicleSpec` handed in. The
+default mix is 40% sedan, 25% motorcycle, 20% tuktuk, 10% truck, 5% bus,
+realised as **counts** rather than sampled — at 20 agents an independently
+sampled 5% bus share gives a run with no bus about a third of the time.
+
+```python
+TrafficEnv("manhattan", n_agents=20)                      # the default mix
+TrafficEnv("manhattan", vehicle_types="sedan")            # one type
+TrafficEnv("manhattan", vehicle_types={"bus": 1, "sedan": 3})
+```
+
+### The policy is told its physics, not its name
+
+The observation carries a `vehicle` block of eight scaled physical
+parameters — length, width, mass, wheelbase, max steer, accel, brake, top
+speed — rather than a one-hot type ID. One shared policy then spans the
+fleet and could in principle drive a type it never saw; a one-hot cannot,
+and grows every time a type is added.
+
+### Budgets come from the vehicle
+
+`envs/budgets.py` holds `d_i` per type. This is `paper-idea.md`'s
+personality-as-budget idea, except grounded in physics rather than an
+invented trait vector — every difference is one you can argue about:
+
+- a **bus** gets a tight jerk budget (standing passengers) and a loose
+  `lane_keep` budget (twelve metres cannot hold a lane through a turn)
+- a **truck** gets a tight speeding budget (stopping distance)
+- a **motorcycle** and **tuktuk** get tight TTC budgets (no crumple zone)
+
+The observation carries the agent's own budget vector, so one network can
+drive a bus cautiously and a rickshaw loosely instead of averaging them
+into a vehicle that is neither.
+
+**These differences are not decorative.** Cost per active agent-step,
+manhattan, 24 agents, scripted driver:
+
+| type | lane_keep | ttc | jerk | offroad |
+|---|---|---|---|---|
+| motorcycle | 0.018 | 0.042 | 0.144 | 0.094 |
+| tuktuk | 0.066 | 0.051 | 0.179 | 0.155 |
+| sedan | 0.117 | 0.069 | 0.157 | 0.081 |
+| truck | 0.283 | 0.094 | 0.276 | 0.056 |
+| bus | 0.332 | 0.106 | 0.179 | 0.030 |
+
+`lane_keep` rises monotonically with size, unprompted — big vehicles
+physically cannot hold a lane centre. That is the evidence for the loose bus
+budget, rather than an assertion about it.
+
+### What the vehicle model does not do
+
+**Roll-over.** A bus tips at about 7.4 m/s² lateral, below where its tyres
+would slide, so a real one rolls rather than slides. Modelling that needs
+suspension and load transfer, and charging it needs an eighth cost channel —
+at six simultaneous constraints, where dual ascent already oscillates.
+Instead tippy vehicles carry reduced grip, so they lose traction roughly
+where they would have tipped, and the failure reads as understeer.
+
+**Leaning.** A motorcycle here is a very narrow four-wheeler. Right
+footprint, mass and acceleration — which is what decides whether it fits a
+gap — and the wrong reason for staying upright.
+
+**Articulated vehicles.** A bendy bus or semi-trailer needs a hitch angle
+and a second body: different code, not different numbers. Left out.
 
 ---
 
@@ -207,6 +295,9 @@ decision worth owning. What a violation is *worth* is not set here.
                        far waypoint (fwd, left), bend ahead
   "lidar":      (120,) ranges, 360° sweep, 100 m
   "radar":      (5, 4) nearest 5 movers: fwd, left, rel fwd speed, rel left speed
+  "vehicle":    (8,)   own length, width, mass, wheelbase, steer, accel,
+                       brake, top speed — scaled, not a one-hot type
+  "budget":     (7,)   own cost budgets, in COST_CHANNELS order
 }
 ```
 
@@ -465,8 +556,7 @@ conflict — so it keeps its dial.
   results section needs.
 - **No SB3 or PettingZoo adapter.** `VecTrafficEnv` is the vectorised
   interface, but it is this project's shape, not either library's.
-- **One vehicle type.** `TrafficEnv(vehicle_cls=...)` takes any class with
-  `Sedan`'s interface, but only `Sedan` exists so far.
+- **No roll-over, leaning or articulated vehicles** (see The fleet, above).
 - **Arcs are lost through a PNG round trip** (see above).
 - **No validation against real trajectory data.** `paper-idea.md` flags this
   as a Phase 5 deliverable, not an afterthought.

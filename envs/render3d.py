@@ -245,7 +245,14 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
     return root
 
 
-def vehicle_nodes(rects, ego: int = 0, height: float = 1.45) -> NodePath:
+# Body height per fleet type, for drawing only — the sensors are top-down
+# and never ask. A bus drawn at a car's height reads as a very long car.
+VEHICLE_HEIGHT = {"motorcycle": 1.30, "tuktuk": 1.70, "sedan": 1.45,
+                  "truck": 3.00, "bus": 3.20}
+
+
+def vehicle_nodes(rects, ego: int = 0, height: float = 1.45,
+                  types=None) -> NodePath:
     """Every vehicle as a block, ego in a different colour. Rebuilt per frame
     — a few dozen boxes is cheaper to regenerate than to keep in sync."""
     root = NodePath("vehicles")
@@ -253,8 +260,9 @@ def vehicle_nodes(rects, ego: int = 0, height: float = 1.45) -> NodePath:
     mine = _Mesh("ego", EGO)
     for k, (cx, cy, hl, hw, yaw) in enumerate(np.asarray(rects).reshape(-1, 5)):
         mesh = mine if k == ego else others
+        top = height if types is None else VEHICLE_HEIGHT.get(types[k], height)
         mesh.box(float(cx), float(cy), float(hl), float(hw), float(yaw),
-                 0.2, height)
+                 0.2, top)
     for mesh in (others, mine):
         node = mesh.node()
         if node is not None:
@@ -326,14 +334,14 @@ class Renderer3D:
     # -- frames -----------------------------------------------------------
 
     def frame(self, rects=None, ego: int = 0, camera: str = "orbit",
-              fov: float = 70.0, path: str | None = None):
+              fov: float = 70.0, path: str | None = None, types=None):
         """Render one frame. Returns an (H, W, 3) uint8 array, or writes a
         PNG and returns the path when `path` is given."""
         if self._vehicles is not None:
             self._vehicles.removeNode()
             self._vehicles = None
         if rects is not None and len(rects):
-            self._vehicles = vehicle_nodes(rects, ego=ego)
+            self._vehicles = vehicle_nodes(rects, ego=ego, types=types)
             self._vehicles.reparentTo(self.base.render)
 
         lens = PerspectiveLens()

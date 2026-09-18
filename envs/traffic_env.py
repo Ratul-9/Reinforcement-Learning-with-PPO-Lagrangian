@@ -47,7 +47,8 @@ from gymnasium import spaces
 
 from envs import sensors
 from envs.world import World, wrap_pi
-from vehicle import Sedan, Gear
+from vehicle import Vehicle, Sedan, Gear
+import fleet
 
 # -- episode shape --------------------------------------------------------
 MAX_EPISODE_SECONDS = 90.0
@@ -124,6 +125,27 @@ JERK_TAU = 0.3               # s, acceleration low-pass time constant
 JERK_THRESHOLD = 2.5         # m/s^3 of FILTERED jerk
 
 
+# Physical parameters the policy is told about itself. Chosen as the things
+# that change what a manoeuvre COSTS, not what the vehicle is: a policy that
+# knows its length, its braking and its turning radius can work out whether
+# it fits through a gap without being told it is a bus.
+VEHICLE_FEATURES = 8
+
+
+def _spec_vector(spec) -> list:
+    """One vehicle's physical parameters, scaled to roughly unit range.
+
+    Scaled because these are raw SI numbers spanning four orders of
+    magnitude — 180 kg to 12000 kg alongside a 0.3 rad steering limit — and
+    an unnormalised input like that dominates the first layer of any network
+    that is not given a normaliser of its own.
+    """
+    return [spec.length / 12.0, spec.width / 2.6, spec.mass / 12000.0,
+            spec.wheelbase / 6.0, spec.max_steer_deg / 45.0,
+            spec.max_accel / 4.0, spec.max_brake / 8.0,
+            spec.max_speed / 50.0]
+
+
 def batch_obs(observations) -> dict:
     """A list of per-agent observation dicts as one dict of stacked arrays.
 
@@ -166,7 +188,8 @@ class TrafficEnv(gym.Env):
 
     def __init__(self, scenario="intersection_x", n_agents: int = 20,
                  dt: float = 0.1, seed: int | None = None,
-                 scenery_density: float = 1.0, vehicle_cls=Sedan,
+                 scenery_density: float = 1.0,
+                 vehicle_types=None,
                  max_seconds: float = MAX_EPISODE_SECONDS,
                  world: World | None = None,
                  arrival_spread: float = ARRIVAL_SPREAD,
@@ -177,7 +200,6 @@ class TrafficEnv(gym.Env):
         self.dt = float(dt)
         self.n_agents = int(n_agents)
         self.max_steps = int(max_seconds / self.dt)
-        self.vehicle_cls = vehicle_cls
         self.arrival_spread = float(arrival_spread)
         self.respawn_delay = float(respawn_delay)
         self.initial_active = float(initial_active)
@@ -189,13 +211,31 @@ class TrafficEnv(gym.Env):
             scenario, rng=np.random.default_rng(seed),
             scenery_density=scenery_density)
 
-        self.vehicles = [vehicle_cls(dt=self.dt) for _ in range(self.n_agents)]
-        v = self.vehicles[0]
-        # Body footprint: axles plus an overhang each end, track plus mirrors.
-        self.half_length = (v.lf + v.lr) / 2.0 + 0.6
-        self.half_width = v.track_width / 2.0 + 0.2
+        # The fleet. `vehicle_types` is a type name, a list of names (one
+        # per agent, cycled), or a dict of name -> proportion.
+        self.vehicle_types = self._draw_types(vehicle_types)
+        self.vehicles = [Vehicle(dt=self.dt, spec=fleet.FLEET[name])
+                         for name in self.vehicle_types]
 
-        self.action_space = v.action_space
+        # Footprints are PER AGENT now, not one number for the fleet: a bus
+        # is twelve metres long and a motorcycle is two, and a single
+        # half-length would either let buses overlap or make motorcycles
+        # collide with thin air.
+        self.half_length = np.array(
+            [fleet.FLEET[n].length / 2.0 for n in self.vehicle_types])
+        self.half_width = np.array(
+            [fleet.FLEET[n].width / 2.0 for n in self.vehicle_types])
+
+        # Physical parameters and budgets, as observation rows. Built once:
+        # a vehicle's spec does not change during a run.
+        from envs.budgets import as_vector
+        self._vehicle_obs = np.array(
+            [_spec_vector(fleet.FLEET[n]) for n in self.vehicle_types],
+            dtype=np.float32)
+        self._budget_obs = np.array(
+            [as_vector(n) for n in self.vehicle_types], dtype=np.float32)
+
+        self.action_space = self.vehicles[0].action_space
         self.observation_space = spaces.Dict({
             # [vx, vy, yaw_rate, steering_angle, gear, road_margin,
             #  heading_error, lane_offset, lane_index_norm, wrong_way]
@@ -212,6 +252,20 @@ class TrafficEnv(gym.Env):
             "navigation": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
             "lidar": spaces.Box(0.0, LIDAR_RANGE, shape=(LIDAR_RAYS,), dtype=np.float32),
             "radar": spaces.Box(-np.inf, np.inf, shape=(RADAR_OBJECTS, 4), dtype=np.float32),
+            # What vehicle am I driving, and what am I allowed to spend?
+            #
+            # Physical parameters rather than a one-hot type ID, so ONE
+            # shared policy spans the fleet and could in principle drive a
+            # vehicle it never saw in training — a one-hot cannot, and grows
+            # every time a type is added.
+            "vehicle": spaces.Box(-np.inf, np.inf, shape=(VEHICLE_FEATURES,),
+                                  dtype=np.float32),
+            # The agent's own cost budgets, in COST_CHANNELS order. A policy
+            # conditioned on its budget is what makes one network able to
+            # drive a bus cautiously and a rickshaw loosely, instead of
+            # averaging the two into a vehicle that is neither.
+            "budget": spaces.Box(0.0, np.inf, shape=(len(COST_CHANNELS),),
+                                 dtype=np.float32),
         })
 
         self._goals = np.zeros((self.n_agents, 2))
@@ -227,6 +281,47 @@ class TrafficEnv(gym.Env):
         self._active = np.zeros(self.n_agents, dtype=bool)
         self._wait = np.zeros(self.n_agents)     # seconds until arrival
         self._far = 0.0                          # where parked vehicles go
+
+    def _draw_types(self, vehicle_types) -> list:
+        """One type name per agent.
+
+        Accepts a single name, a list (cycled to length), or a dict of
+        name -> proportion. The proportions are realised as COUNTS rather
+        than sampled independently: at twenty agents and a 5% bus share,
+        independent sampling gives a run with no bus in it about a third of
+        the time, and "the scenario had no bus" is not a result anyone wants
+        to discover afterwards in the logs.
+        """
+        if vehicle_types is None:
+            vehicle_types = fleet.DEFAULT_MIX
+        if isinstance(vehicle_types, str):
+            vehicle_types = [vehicle_types]
+
+        if isinstance(vehicle_types, dict):
+            names = list(vehicle_types)
+            weights = np.array([float(vehicle_types[n]) for n in names])
+            weights = weights / weights.sum()
+            counts = np.floor(weights * self.n_agents).astype(int)
+            # Hand the remainder to whichever types lost the most to
+            # rounding, so a 5% share of twenty agents becomes one bus
+            # rather than none.
+            short = self.n_agents - counts.sum()
+            if short > 0:
+                order = np.argsort(-(weights * self.n_agents - counts))
+                counts[order[:short]] += 1
+            drawn = [n for n, c in zip(names, counts) for _ in range(c)]
+        else:
+            drawn = [vehicle_types[i % len(vehicle_types)]
+                     for i in range(self.n_agents)]
+
+        unknown = set(drawn) - set(fleet.FLEET)
+        if unknown:
+            raise ValueError(f"unknown vehicle type(s) {sorted(unknown)}. "
+                             f"Known: {', '.join(fleet.FLEET)}")
+        # Shuffled so type is not correlated with agent index, which would
+        # otherwise put every bus at the front of every spawn order.
+        self.rng.shuffle(drawn)
+        return drawn
 
     # -- reset ------------------------------------------------------------
 
@@ -307,7 +402,7 @@ class TrafficEnv(gym.Env):
             x, y, heading = self.world.sample_start(self.rng, declared=attempt < 6)
             gx, gy, route = self.world.sample_goal(self.rng, (x, y), MIN_ROUTE)
             x, y, heading = self._snap_to_lane(x, y, (gx, gy), heading)
-            rect = (x, y, self.half_length, self.half_width, heading)
+            rect = (x, y, self.half_length[i], self.half_width[i], heading)
             clear = not self.world.rect_hits_rects(rect, others).any()
             # Re-ask the lane graph rather than trusting the snap. Near a
             # junction — a roundabout entry especially — the piece whose edge
@@ -361,8 +456,10 @@ class TrafficEnv(gym.Env):
 
     def _rects(self) -> np.ndarray:
         """(n_agents, 5) footprints of every vehicle, this instant."""
-        return np.array([(v.x, v.y, self.half_length, self.half_width, v.heading)
-                         for v in self.vehicles], dtype=float)
+        return np.array([(v.x, v.y, hl, hw, v.heading)
+                         for v, hl, hw in zip(self.vehicles,
+                                              self.half_length,
+                                              self.half_width)], dtype=float)
 
     def vehicle_rects(self) -> np.ndarray:
         """Footprints of the vehicles actually ON the road — what a renderer
@@ -467,7 +564,7 @@ class TrafficEnv(gym.Env):
                 # loss: by then the vehicle is most of a lane out, and
                 # whatever it does next is already being charged as
                 # wrong_way or offroad.
-                slack = max(fix.lane.width / 2.0 - self.half_width, 0.25)
+                slack = max(fix.lane.width / 2.0 - self.half_width[i], 0.25)
                 costs["lane_keep"][i] = _ramp(abs(fix.offset), slack)
 
             ttc = self._time_to_collision(i, moving)
@@ -490,7 +587,9 @@ class TrafficEnv(gym.Env):
 
         obs = self._observations()
         info = {"cost": costs, "events": events, "active": self._active.copy(),
-                "route": self._route_prev.copy()}
+                "route": self._route_prev.copy(),
+                "vehicle_type": list(self.vehicle_types),
+                "budget": self._budget_obs.copy()}
 
         # Retire whatever finished. Done AFTER the observation is taken: the
         # learner's last observation of an episode must be the state the
@@ -524,7 +623,7 @@ class TrafficEnv(gym.Env):
         standard surrogate-safety measure, and as a COST it only has to be
         monotone in danger, not accurate.
         """
-        r = math.hypot(self.half_length, self.half_width) * 2.0
+        r = math.hypot(self.half_length[i], self.half_width[i]) * 2.0
         rel_p = np.delete(moving[:, :2] - moving[i, :2], i, axis=0)
         rel_v = np.delete(moving[:, 2:] - moving[i, 2:], i, axis=0)
         if len(rel_p) == 0:
@@ -554,7 +653,7 @@ class TrafficEnv(gym.Env):
                 # is parked far outside the world, so its lidar would be 120
                 # rays of max_range and its route a straight line across
                 # empty space — the expensive way to compute nothing.
-                out.append(self._blank_observation())
+                out.append(self._blank_observation(i))
                 continue
             margin, lateral, tangent = self.world.road_state(veh.x, veh.y)
             goal = tuple(self._goals[i])
@@ -594,18 +693,25 @@ class TrafficEnv(gym.Env):
                                        moving[i, 2:], np.delete(moving, i, axis=0),
                                        max_objects=RADAR_OBJECTS,
                                        max_range=LIDAR_RANGE),
+                "vehicle": self._vehicle_obs[i],
+                "budget": self._budget_obs[i],
             })
         return out
 
-    @staticmethod
-    def _blank_observation() -> dict:
+    def _blank_observation(self, i: int) -> dict:
         """The observation of a vehicle that is not on the road. Zeros, and
         the lidar at full range — the shape the space promises, carrying no
         claim about a world this vehicle is not in."""
         return {"state": np.zeros(10, dtype=np.float32),
                 "navigation": np.zeros(6, dtype=np.float32),
                 "lidar": np.full(LIDAR_RAYS, LIDAR_RANGE, dtype=np.float32),
-                "radar": np.zeros((RADAR_OBJECTS, 4), dtype=np.float32)}
+                "radar": np.zeros((RADAR_OBJECTS, 4), dtype=np.float32),
+                # Vehicle and budget stay REAL even while parked: they are
+                # properties of the agent, not of the world it is in, and
+                # zeroing them would tell the policy it is driving a
+                # zero-length vehicle with a zero collision budget.
+                "vehicle": self._vehicle_obs[i],
+                "budget": self._budget_obs[i]}
 
     @staticmethod
     def _to_ego(veh, point) -> tuple[float, float]:

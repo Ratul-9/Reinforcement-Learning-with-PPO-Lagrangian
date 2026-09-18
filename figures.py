@@ -43,14 +43,18 @@ def render_one(scenario: str) -> None:
     render_mpl.draw(env.world, vehicles=rects, goals=goals,
                     path=f"{OUT}/{scenario}_plan.png")
 
+    types = [t for t, on in zip(env.vehicle_types, env._active) if on]
     renderer = Renderer3D(env.world, size=(1600, 1000))
-    renderer.frame(rects, camera="orbit", path=f"{OUT}/{scenario}_aerial.png")
+    renderer.frame(rects, camera="orbit", types=types,
+                   path=f"{OUT}/{scenario}_aerial.png")
     # Frame the ego on whichever vehicle is actually moving, so the driver's
     # view is of a road being driven rather than of the inside of a bay.
     live = [v for v, on in zip(env.vehicles, env._active) if on]
     ego = max(range(len(live)), key=lambda i: abs(live[i].vx))
-    renderer.frame(rects, ego=ego, camera="chase", path=f"{OUT}/{scenario}_chase.png")
-    renderer.frame(rects, ego=ego, camera="ego", path=f"{OUT}/{scenario}_driver.png")
+    renderer.frame(rects, ego=ego, camera="chase", types=types,
+                   path=f"{OUT}/{scenario}_chase.png")
+    renderer.frame(rects, ego=ego, camera="ego", types=types,
+                   path=f"{OUT}/{scenario}_driver.png")
     renderer.close()
 
 

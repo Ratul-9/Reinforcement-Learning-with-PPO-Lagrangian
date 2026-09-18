@@ -28,12 +28,15 @@ def bare(kind="cross", seed=0):
                        scenery_density=0.0, bays=False)
 
 
-ALL_ON = dict(initial_active=1.0, arrival_spread=0.0, respawn_delay=0.0)
+ALL_ON = dict(initial_active=1.0, arrival_spread=0.0, respawn_delay=0.0,
+              vehicle_types="sedan")
 """Every vehicle on the road at reset and back instantly after it finishes.
 
-Staggered arrivals are the default and are what a training run wants, but a
-test that provokes one specific cost on one specific vehicle cannot also be
-waiting to find out whether that vehicle exists yet."""
+Staggered arrivals and a mixed fleet are the defaults and are what a
+training run wants, but a test that provokes one specific cost on one
+specific vehicle cannot also be waiting to find out whether that vehicle
+exists yet, nor discovering that this time it drew a motorcycle whose
+footprint, braking and top speed are all different."""
 
 
 def drive(throttle=0.6, steering=0.0, brake=0.0, gear=3):
@@ -245,7 +248,7 @@ def test_lane_keep_cost_fires():
     inward = -1.0 if fix.lane.offset > 0 else 1.0
 
     charged = []
-    for shift in (0.0, 0.8, 1.4):
+    for shift in (0.0, 1.1, 1.6):
         shift *= inward
         veh.x, veh.y = x0 - ty * shift, y0 + tx * shift
         _, _, _, _, info = env.step([drive(throttle=0.0)])

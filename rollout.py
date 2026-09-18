@@ -51,6 +51,12 @@ def pure_pursuit(obs) -> dict:
     # the yaw rate: by the time a vehicle is yawing it is already in the bend.
     ease = 1.0 - SLOW_FOR_BEND * min(abs(float(bend)) / (math.pi / 2), 1.0)
     target = TARGET_SPEED * max(ease, 0.25)
+    # Never ask for more than this vehicle has. The last element of the
+    # `vehicle` block is its governed top speed, scaled by 50 m/s — a tuktuk
+    # tops out at 15 m/s, and a controller demanding 7 m/s uphill of that is
+    # holding full throttle forever and reporting it as a tracking error.
+    if "vehicle" in obs:
+        target = min(target, float(obs["vehicle"][7]) * 50.0 * 0.85)
 
     speed = float(obs["state"][0])
     throttle = float(np.clip((target - speed) * 0.5, 0.0, 1.0))

@@ -3,22 +3,36 @@ from enum import Enum
 import gymnasium as gym
 from gymnasium import spaces
 
+from fleet import SEDAN, VehicleSpec
+
 class Gear(Enum):
     PARK = 0
     REVERSE = 1
     NEUTRAL = 2
     DRIVE = 3
 
-class Sedan:
+class Vehicle:
     """
-    Sedan vehicle model for multi-agent RL (e.g. PPO Lagrangian).
-    Uses a 4-Wheel Dynamic Vehicle Model for realistic physics (slip angles, 
+    Vehicle model for multi-agent RL (e.g. PPO Lagrangian).
+    Uses a 4-Wheel Dynamic Vehicle Model for realistic physics (slip angles,
     lateral forces, mass inertia, and track width).
     Designed to be a plug-and-play component for any grid/continuous environment.
+
+    The physics is one model for the whole fleet; what differs between a
+    motorcycle and a bus is the `VehicleSpec` handed in, not the equations.
+    A spec that is twelve metres long with a high centre of gravity produces
+    a vehicle that understeers, brakes slowly and cannot clear a junction in
+    the time a car can, purely out of its own numbers.
+
+    `Sedan` below is this class bound to the sedan spec, so every existing
+    caller keeps working and keeps the behaviour it had before the fleet
+    existed.
     """
-    def __init__(self, spawn_point=(0.0, 0.0), destination=(100.0, 100.0), dt=0.1):
+    def __init__(self, spawn_point=(0.0, 0.0), destination=(100.0, 100.0), dt=0.1,
+                 spec: VehicleSpec = SEDAN):
         # Environment properties
         self.dt = dt
+        self.spec = spec
         self.spawn_point = np.array(spawn_point, dtype=np.float32)
         self.destination = np.array(destination, dtype=np.float32)
         
@@ -34,26 +48,31 @@ class Sedan:
         self.steering_angle = 0.0
         self.gear = Gear.PARK
         
-        # --- Sedan Physical Parameters ---
-        self.mass = 1500.0 # kg
-        self.Iz = 3000.0 # Yaw moment of inertia (kg*m^2)
-        self.lf = 1.2 # Distance from CG to front axle (m)
-        self.lr = 1.6 # Distance from CG to rear axle (m)
-        self.track_width = 1.8 # m
-        self.wheelbase = self.lf + self.lr
-        
-        self.max_steer_angle = np.radians(35.0)
-        self.max_accel = 3.0 # m/s^2 (corresponds to engine force)
-        self.max_brake = 8.0 # m/s^2
-        self.drag_coef = 0.3 # Aerodynamic drag coefficient
-        self.frontal_area = 2.2 # m^2
+        # --- Physical Parameters, from the spec ---
+        self.mass = spec.mass # kg
+        self.Iz = spec.yaw_inertia # Yaw moment of inertia (kg*m^2)
+        self.lf = spec.lf # Distance from CG to front axle (m)
+        self.lr = spec.lr # Distance from CG to rear axle (m)
+        self.track_width = spec.track_width # m
+        self.wheelbase = spec.wheelbase
+        self.length = spec.length
+        self.width = spec.width
+
+        self.max_steer_angle = np.radians(spec.max_steer_deg)
+        self.max_accel = spec.max_accel # m/s^2 (corresponds to engine force)
+        self.max_brake = spec.max_brake # m/s^2
+        self.max_speed = spec.max_speed # m/s, governed
+        self.drag_coef = spec.drag_coef # Aerodynamic drag coefficient
+        self.frontal_area = spec.frontal_area # m^2
         self.air_density = 1.225 # kg/m^3
         self.gravity = 9.81
-        
+
         # Tire parameters (Linear tire model with friction circle)
-        self.Cf = 100000.0 # Front cornering stiffness (N/rad) - total for axle
-        self.Cr = 100000.0 # Rear cornering stiffness (N/rad) - total for axle
-        self.mu = 0.9 # Friction coefficient
+        self.Cf = spec.cornering_stiffness # Front cornering stiffness (N/rad)
+        self.Cr = spec.cornering_stiffness # Rear cornering stiffness (N/rad)
+        # Effective, not nominal: a vehicle that would tip before it slid
+        # carries reduced grip as a stand-in for roll-over. See fleet.py.
+        self.mu = spec.effective_mu
         
         # Sensor configurations
         self.rgb_resolution = (64, 64, 3)
@@ -249,6 +268,11 @@ class Sedan:
             self.y += Y_dot * self.dt
             self.heading += self.yaw_rate * self.dt
             
+        # Governor. Without it every spec shares the sedan's top speed,
+        # because nothing else in the model bounds velocity except drag —
+        # and drag alone lets a 450 kg tuktuk reach motorway speed.
+        self.vx = float(np.clip(self.vx, -self.max_speed, self.max_speed))
+
         # Normalize heading to [-pi, pi]
         self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
         
@@ -286,3 +310,25 @@ class Sedan:
             if 'radar' in external_sensors: obs['radar'] = external_sensors['radar']
                 
         return obs
+
+
+class Sedan(Vehicle):
+    """The original vehicle, unchanged: `Vehicle` bound to the sedan spec.
+
+    Kept as its own name because `Vehicle.md`, the tests and the env all
+    refer to it, and because "the baseline vehicle" is worth being able to
+    say in one word.
+    """
+
+    def __init__(self, spawn_point=(0.0, 0.0), destination=(100.0, 100.0), dt=0.1):
+        super().__init__(spawn_point, destination, dt, spec=SEDAN)
+
+
+def make(type_name: str, **kwargs) -> Vehicle:
+    """A vehicle by fleet name — `make("bus")`, `make("tuktuk")`."""
+    from fleet import FLEET
+
+    if type_name not in FLEET:
+        raise ValueError(f"unknown vehicle type {type_name!r}. "
+                         f"Known: {', '.join(FLEET)}")
+    return Vehicle(spec=FLEET[type_name], **kwargs)
