@@ -8,6 +8,9 @@ sensors cannot see, and nothing the sensors see is missing here.
 Three camera modes, and the third is the point of the file:
 
     "orbit"  the whole network from above and behind — the audit view
+    "close"  a low oblique on one point — for detail a whole-map view
+             cannot show. A 5.5 m bridge deck on a 450 m layout is two
+             pixels from the orbit camera; it is the scale, not the render
     "chase"  over one vehicle's shoulder — the rollout video
     "ego"    from the driver's eye — THE PIXEL OBSERVATION HOOK
 
@@ -48,6 +51,7 @@ TRUNK = (0.33, 0.25, 0.18, 1.0)
 CANOPY = (0.22, 0.45, 0.20, 1.0)
 VEHICLE = (0.85, 0.51, 0.17, 1.0)
 BLOCKAGE = (0.55, 0.13, 0.13, 1.0)      # a stalled vehicle in the lane
+STRUCTURE = (0.58, 0.57, 0.55, 1.0)     # bridge abutment / ramp embankment
 EGO = (0.17, 0.50, 0.85, 1.0)
 
 # Draw heights. The order is load-bearing rather than cosmetic: pads sit
@@ -242,6 +246,30 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
         blocked.box(float(cx), float(cy), float(hl), float(hw), float(yaw),
                     0.2, 1.45)
 
+    # Sides for anything elevated: an embankment under a ramp, an abutment
+    # under a deck. Without them a raised road is a ribbon floating in mid
+    # air with no visible support, which reads as a rendering fault rather
+    # than as a bridge.
+    structure = _Mesh("structure", STRUCTURE)
+    for piece in world.net.pieces:
+        if piece.z0 == 0.0 and piece.z1 == 0.0:
+            continue
+        poly = piece.polyline(0.0, piece.length)
+        span = max(len(poly) - 1, 1)
+        heights = [piece.z0 + (piece.z1 - piece.z0) * k / span
+                   for k in range(len(poly))]
+        for sign in (1.0, -1.0):
+            edge = _offset(poly, sign * piece.half_width)
+            for i in range(len(poly) - 1):
+                if max(heights[i], heights[i + 1]) < 0.15:
+                    continue
+                structure.quad3(
+                    (edge[i][0], edge[i][1], 0.0),
+                    (edge[i + 1][0], edge[i + 1][1], 0.0),
+                    (edge[i + 1][0], edge[i + 1][1], heights[i + 1] + ROAD_Z),
+                    (edge[i][0], edge[i][1], heights[i] + ROAD_Z),
+                    normal=(sign, 0.0, 0.0))
+
     buildings = _Mesh("buildings", BUILDING)
     for cx, cy, hl, hw, yaw, h in world.scenery.boxes:
         buildings.box(float(cx), float(cy), float(hl), float(hw), float(yaw),
@@ -256,7 +284,7 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
 
     for mesh, offset in ((ground, 0), (surface, 2), (pads, 4), (paint, 3),
                          (islands, 5), (buildings, 0), (trunks, 0),
-                         (canopies, 0), (blocked, 0)):
+                         (canopies, 0), (blocked, 0), (structure, 0)):
         node = mesh.node()
         if node is not None:
             # A few centimetres of lift is below the depth buffer's
@@ -329,13 +357,32 @@ class Renderer3D:
 
     # -- cameras ----------------------------------------------------------
 
-    def _place_camera(self, mode: str, rects, ego: int) -> None:
+    def _place_camera(self, mode: str, rects, ego: int,
+                      focus=None, distance: float = 70.0) -> None:
         cam = self.base.camera
+        if mode == "close":
+            # Low and near, so height reads. `focus` defaults to the centre
+            # of the road network — which for a grade separation is exactly
+            # the crossing.
+            if focus is None:
+                x0, y0, x1, y1 = self.world.net.bounds()
+                focus = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            fx, fy = float(focus[0]), float(focus[1])
+            cam.setPos(fx - distance * 0.75, fy - distance * 0.75,
+                       distance * 0.38)
+            cam.lookAt(Point3(fx, fy, 2.0))
+            return
         if mode == "orbit" or rects is None or not len(rects):
-            x0, y0, x1, y1 = self.world.bounds()
+            # Frame the ROADS, not the ground pad. World bounds include the
+            # scenery and the margin around it, which on a 400 m layout put
+            # the camera far enough back that a 5.5 m bridge deck was a
+            # single pixel.
+            x0, y0, x1, y1 = self.world.net.bounds()
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-            span = max(x1 - x0, y1 - y0)
-            cam.setPos(cx, cy - span * 0.85, span * 0.75)
+            span = max(x1 - x0, y1 - y0) * 1.15
+            # A lower angle than a plan view: elevation is invisible from
+            # directly overhead, and these layouts have a bridge in them.
+            cam.setPos(cx, cy - span * 0.80, span * 0.42)
             cam.lookAt(Point3(cx, cy, 0.0))
             return
 
@@ -357,7 +404,8 @@ class Renderer3D:
     # -- frames -----------------------------------------------------------
 
     def frame(self, rects=None, ego: int = 0, camera: str = "orbit",
-              fov: float = 70.0, path: str | None = None, types=None):
+              fov: float = 70.0, path: str | None = None, types=None,
+              focus=None, distance: float = 70.0):
         """Render one frame. Returns an (H, W, 3) uint8 array, or writes a
         PNG and returns the path when `path` is given."""
         if self._vehicles is not None:
@@ -371,7 +419,7 @@ class Renderer3D:
         lens.setFov(fov)
         lens.setNearFar(0.3, 3000.0)
         self.base.cam.node().setLens(lens)
-        self._place_camera(camera, rects, ego)
+        self._place_camera(camera, rects, ego, focus, distance)
 
         self.base.graphicsEngine.renderFrame()
         self.base.graphicsEngine.renderFrame()   # one to build, one to settle

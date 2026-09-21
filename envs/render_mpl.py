@@ -6,8 +6,8 @@ frame dumper for a rollout video. The 3D view is `envs/render3d.py`; both
 draw the same `World`, so a disagreement between them is a bug in one of
 them rather than two pictures of two worlds.
 
-    python -m envs.render_mpl                 # all scenarios -> scenarios.png
-    python -m envs.render_mpl roundabout_yield
+    python -m envs.render_mpl                 # the seven -> scenarios.png
+    python -m envs.render_mpl overbridge      # one, full size
 """
 
 from __future__ import annotations
@@ -159,7 +159,8 @@ def contact_sheet(path: str = "scenarios.png", kinds=None,
                   scenery_density: float = 1.0, seed: int = 0):
     """Every scenario on one sheet — the picture to look at after changing a
     builder, a scenery rule, or the widths."""
-    kinds = list(kinds or road_network.SCENARIO_KINDS)
+    from envs import scenarios
+    kinds = list(kinds or scenarios.KINDS)
     cols = min(4, len(kinds))
     rows = math.ceil(len(kinds) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows), dpi=100)

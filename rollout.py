@@ -132,7 +132,8 @@ def main() -> None:
                          "table here (PATH.csv and PATH.json)")
     args = ap.parse_args()
 
-    kinds = [args.scenario] if args.scenario else list(road_network.SCENARIO_KINDS)
+    from envs import scenarios
+    kinds = [args.scenario] if args.scenario else list(scenarios.KINDS)
     recorder = EpisodeRecorder() if args.metrics else None
     head = f"{'scenario':18s} {'episodes':>8s} {'goals':>6s} {'crashes':>8s} " \
            f"{'active':>7s}  " + "  ".join(f"{k:>9s}" for k in COST_CHANNELS)

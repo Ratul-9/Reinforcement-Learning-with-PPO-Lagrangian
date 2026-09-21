@@ -55,21 +55,25 @@ def render_one(scenario: str) -> None:
                    path=f"{OUT}/{scenario}_chase.png")
     renderer.frame(rects, ego=ego, camera="ego", types=types,
                    path=f"{OUT}/{scenario}_driver.png")
+    # A close oblique on the middle of the network. Whole-map views cannot
+    # show a 5.5 m bridge deck or a lane divider on a 1400 m motorway.
+    renderer.frame(rects, camera="close", types=types, distance=110.0,
+                   path=f"{OUT}/{scenario}_detail.png")
     renderer.close()
 
 
 def main() -> None:
-    from envs import road_network, render_mpl
+    from envs import render_mpl, scenarios
 
     os.makedirs(OUT, exist_ok=True)
     render_mpl.contact_sheet(f"{OUT}/all_scenarios.png")
     print(f"wrote {OUT}/all_scenarios.png")
 
-    for scenario in road_network.SCENARIO_KINDS:
+    for scenario in scenarios.KINDS:
         subprocess.run([sys.executable, __file__, scenario], check=True,
                        stdout=subprocess.DEVNULL)
         print(f"wrote {OUT}/{scenario}_"
-              "{plan,aerial,chase,driver}.png")
+              "{plan,aerial,chase,driver,detail}.png")
 
 
 if __name__ == "__main__":
