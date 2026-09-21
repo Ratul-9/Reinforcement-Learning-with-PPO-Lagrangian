@@ -123,6 +123,18 @@ def generate(net, rng: np.random.Generator, density: float = 1.0,
     for index, piece in enumerate(net.pieces):
         if piece.lanes < MIN_LANES or piece.length < 2 * JUNCTION_CLEAR:
             continue
+        # No frontage on a ramp or a bridge deck: buildings belong beside a
+        # street, not beside a structure passing overhead, and a building
+        # placed against an elevated alignment would stand in the road that
+        # runs underneath it.
+        if piece.z0 != 0.0 or piece.z1 != 0.0:
+            continue
+        # No frontage on a one-way carriageway either. Those are motorway
+        # carriageways, slip roads and roundabout rings, and none of them
+        # has buildings fronting onto it — a motorway with a terrace down
+        # both sides is a street, which is a different road entirely.
+        if getattr(piece, "oneway", False):
+            continue
 
         for sign in (1.0, -1.0):
             # -- buildings, stepping along the frontage ------------------

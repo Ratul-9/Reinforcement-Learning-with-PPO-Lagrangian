@@ -24,6 +24,8 @@ from envs import road_network
 from envs.world import World
 
 ASPHALT = "#2a2b30"
+DECK = "#3c3e46"          # an elevated carriageway, lighter than the ground
+DECK_EDGE = "#8a8f99"     # its parapet
 MARKING = "#e6e6da"
 GROUND = "#e8e4dc"
 BUILDING = "#8d8579"
@@ -58,9 +60,16 @@ def draw(world: World, vehicles=None, goals=None, path: str | None = None,
 
     # Road surface, then junction pads over it, then markings — the pads
     # exist to mask lane lines inside a junction, so order matters.
-    for piece in net.pieces:
+    # Ground first, then anything elevated on top of it, so a bridge deck
+    # reads as passing OVER the road beneath rather than crossing it.
+    for piece in sorted(net.pieces, key=lambda q: max(q.z0, q.z1)):
         poly = piece.polyline(0.0, piece.length)
-        _ribbon(ax, poly, piece.half_width, ASPHALT, zorder=1)
+        raised = max(piece.z0, piece.z1) > 0.1
+        _ribbon(ax, poly, piece.half_width + (1.0 if raised else 0.0),
+                DECK_EDGE if raised else ASPHALT,
+                zorder=8 if raised else 1)
+        if raised:
+            _ribbon(ax, poly, piece.half_width, DECK, zorder=9)
     for (x, y), pad in zip(net.nodes, net.node_pads):
         if pad > 0.0:
             ax.add_patch(Circle((x, y), pad, color=ASPHALT, zorder=2))

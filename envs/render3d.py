@@ -173,11 +173,20 @@ def _offset(poly: np.ndarray, d: float) -> np.ndarray:
                      poly[:, 1] - seg[:, 0] / n * d], axis=1)
 
 
-def _ribbon(mesh: _Mesh, poly, half_width: float, z: float) -> None:
+def _ribbon(mesh: _Mesh, poly, half_width: float, z: float, zs=None) -> None:
+    """A strip along a centreline. `zs` gives a per-vertex height, for a
+    ramp or a deck; without it the whole strip sits flat at `z`."""
     left = _offset(poly, -half_width)
     right = _offset(poly, half_width)
     for i in range(len(poly) - 1):
-        mesh.quad(right[i], right[i + 1], left[i + 1], left[i], z=z)
+        if zs is None:
+            mesh.quad(right[i], right[i + 1], left[i + 1], left[i], z=z)
+        else:
+            mesh.quad3((right[i][0], right[i][1], z + zs[i]),
+                       (right[i + 1][0], right[i + 1][1], z + zs[i + 1]),
+                       (left[i + 1][0], left[i + 1][1], z + zs[i + 1]),
+                       (left[i][0], left[i][1], z + zs[i]),
+                       normal=(0.0, 0.0, 1.0))
 
 
 # ── scene ────────────────────────────────────────────────────────────────
@@ -200,7 +209,13 @@ def build_scene(world, root: NodePath | None = None) -> NodePath:
     islands = _Mesh("islands", ISLAND)
     for i, piece in enumerate(world.net.pieces):
         poly = piece.polyline(0.0, piece.length)
-        _ribbon(surface, poly, piece.half_width, ROAD_Z)
+        # Height per vertex, so a ramp climbs smoothly instead of stepping.
+        heights = None
+        if piece.z0 != 0.0 or piece.z1 != 0.0:
+            span = max(len(poly) - 1, 1)
+            heights = [piece.z0 + (piece.z1 - piece.z0) * k / span
+                       for k in range(len(poly))]
+        _ribbon(surface, poly, piece.half_width, ROAD_Z, heights)
         inset = max(piece.half_width - _EDGE_INSET, 0.05)
         for side in (inset, -inset):
             _ribbon(paint, _offset(poly, side), _EDGE_WIDTH / 2.0, MARK_Z)

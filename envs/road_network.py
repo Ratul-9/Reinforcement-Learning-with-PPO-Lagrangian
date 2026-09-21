@@ -58,6 +58,7 @@ DEFAULT_LANE_WIDTH = 3.5        # metres per lane — standard urban lane
 # and reads as "off the road" for a step or two mid-turn, which would punish
 # the one manoeuvre an intersection exists to teach.
 JUNCTION_PAD = 1.45
+DEFAULT_SPEED_LIMIT = 13.9      # m/s, 50 km/h — an urban street
 _ARC_STEP_DEG = 5.0             # arc polyline resolution (also the mesh's)
 _EPS = 1e-9
 
@@ -94,7 +95,8 @@ class _Piece:
     piece it is standing on, not the network's nominal one.
     """
 
-    __slots__ = ("node_a", "node_b", "length", "lanes", "half_width", "_poly")
+    __slots__ = ("node_a", "node_b", "length", "lanes", "half_width", "_poly",
+                 "oneway", "z0", "z1", "speed_limit")
 
     def __init__(self, node_a: int, node_b: int):
         self.node_a = node_a
@@ -103,6 +105,22 @@ class _Piece:
         self.lanes = DEFAULT_LANES
         self.half_width = DEFAULT_LANES * DEFAULT_LANE_WIDTH / 2.0
         self._poly: np.ndarray = np.zeros((0, 2))
+        # A ONE-WAY piece carries all of its lanes in the +tangent
+        # direction. A two-way piece splits them by side of the centreline.
+        # Dual carriageways, slip roads and gyratories are one-way; without
+        # this a three-lane motorway carriageway would be modelled as one
+        # and a half lanes each way, which is not a road.
+        self.oneway = False
+        # Elevation at each end, linear in between. Flat everywhere except a
+        # grade separation, where it is the whole point: a bridge deck and
+        # the road beneath it occupy the same x/y and must not see or
+        # collide with each other.
+        self.z0 = 0.0
+        self.z1 = 0.0
+        # Per road, not per world. One global limit made a motorway a 50
+        # km/h road, so the `speeding` cost charged correct motorway driving
+        # and the only way to satisfy it was to crawl.
+        self.speed_limit = DEFAULT_SPEED_LIMIT
 
     # -- geometry ---------------------------------------------------------
 
@@ -123,6 +141,17 @@ class _Piece:
         on-road test needs; |lateral| would wrongly report a point beyond the
         end of a piece as being right next to it."""
         raise NotImplementedError
+
+    def elevation(self, s: float) -> float:
+        """Height above datum at `s`, linear between the ends."""
+        if self.z0 == self.z1:
+            return self.z0
+        t = min(max(s / max(self.length, _EPS), 0.0), 1.0)
+        return self.z0 + (self.z1 - self.z0) * t
+
+    def grade(self) -> float:
+        """Slope as a fraction — 0.05 is a 5% gradient."""
+        return (self.z1 - self.z0) / max(self.length, _EPS)
 
     # -- cached polyline --------------------------------------------------
 
@@ -300,20 +329,31 @@ class RoadNetwork:
         self._pad_auto.append(pad is None and kind != "end")
         return len(self.nodes) - 1
 
-    def _size(self, piece: _Piece, lanes: int | None) -> _Piece:
+    def _size(self, piece: _Piece, lanes: int | None, oneway: bool = False,
+              z=(0.0, 0.0), speed_limit: float | None = None) -> _Piece:
         piece.lanes = self.lanes if lanes is None else max(1, int(lanes))
         piece.half_width = piece.lanes * self.lane_width / 2.0
+        piece.oneway = bool(oneway)
+        piece.z0, piece.z1 = float(z[0]), float(z[1])
+        if speed_limit is not None:
+            piece.speed_limit = float(speed_limit)
         self.max_half_width = max(self.max_half_width, piece.half_width)
         return piece
 
-    def add_straight(self, a: int, b: int, lanes: int | None = None) -> None:
+    def add_straight(self, a: int, b: int, lanes: int | None = None,
+                     oneway: bool = False, z=(0.0, 0.0),
+                     speed_limit: float | None = None) -> None:
         self.pieces.append(self._size(
-            _Straight(a, b, self.nodes[a], self.nodes[b]), lanes))
+            _Straight(a, b, self.nodes[a], self.nodes[b]), lanes, oneway, z,
+            speed_limit))
 
     def add_arc(self, a: int, b: int, center, radius: float,
-                a0: float, sweep: float, lanes: int | None = None) -> None:
+                a0: float, sweep: float, lanes: int | None = None,
+                oneway: bool = False, z=(0.0, 0.0),
+                speed_limit: float | None = None) -> None:
         self.pieces.append(self._size(
-            _Arc(a, b, center, radius, a0, sweep), lanes))
+            _Arc(a, b, center, radius, a0, sweep), lanes, oneway, z,
+            speed_limit))
 
     def add_source(self, x: float, y: float, heading_deg: float) -> None:
         self.sources.append((float(x), float(y), float(heading_deg)))
@@ -528,6 +568,16 @@ class RoadNetwork:
                 margin = min(margin, -inside)
         tx, ty = self.pieces[i].tangent(s)
         return margin, lateral, math.atan2(ty, tx)
+
+    def speed_limit_at(self, x: float, y: float) -> float:
+        """The limit on the road under a point."""
+        i, _s, _lateral, _d = self.project(x, y)
+        return self.pieces[i].speed_limit
+
+    def elevation_at(self, x: float, y: float) -> float:
+        """Height of the road surface under a point. Zero on a flat map."""
+        i, s, _lateral, _d = self.project(x, y)
+        return self.pieces[i].elevation(s)
 
     def heading_at(self, x: float, y: float) -> float:
         """Compass-free tangent of the nearest centreline, in radians as
@@ -840,6 +890,29 @@ KIND_FIELDS: dict[str, tuple[str, list]] = {
 
 
 def build(spec: dict | str | None = None) -> RoadNetwork:
+    """Build a network from a spec dict (or a bare kind name).
+
+    Dispatches to `envs/scenarios.py` for the seven purpose-built training
+    layouts, and to the builders below for the original set.
+    """
+    from envs import scenarios
+
+    kind = (spec if isinstance(spec, str)
+            else (spec or {}).get("kind", "cross"))
+    if kind in scenarios.BUILDERS:
+        merged = dict(scenarios.DEFAULTS[kind], kind=kind)
+        if isinstance(spec, dict):
+            merged.update({k: v for k, v in spec.items()})
+        net = RoadNetwork(
+            half_width=merged["lanes"] * DEFAULT_LANE_WIDTH / 2.0,
+            lanes=merged["lanes"], lane_width=DEFAULT_LANE_WIDTH,
+            spec=merged)
+        scenarios.BUILDERS[kind](net, merged)
+        return net.finalize()
+    return _build_legacy(spec)
+
+
+def _build_legacy(spec: dict | str | None = None) -> RoadNetwork:
     """Build a network from a spec dict (or a bare kind name). Unknown keys are
     ignored rather than rejected so an older saved road still loads after a
     builder gains a parameter."""

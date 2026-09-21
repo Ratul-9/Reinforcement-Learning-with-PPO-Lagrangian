@@ -53,14 +53,17 @@ class World:
     mid-run: moving the geometry under vehicles that are driving on it would
     teleport them off the road."""
 
-    def __init__(self, net, objects: scenery.Scenery, spec: dict):
+    def __init__(self, net, objects: scenery.Scenery, spec: dict,
+                 drive_side: str = "right"):
         self.net = net
         self.scenery = objects
         self.spec = dict(spec)
+        self.drive_side = drive_side
+        self.spec["drive_side"] = drive_side
         # Derived, not stored: the lane count on each piece already implies
         # the lanes, so a network from any source gets them without the
         # builders (or the PNG loader) knowing lanes exist.
-        self.lanes = LaneGraph(net)
+        self.lanes = LaneGraph(net, drive_side)
 
         # Stalled vehicles blocking a lane, kept separately from the
         # scenery they are concatenated into: the sensors want one array,
@@ -84,7 +87,8 @@ class World:
     @classmethod
     def build(cls, spec="cross", rng: np.random.Generator | None = None,
               scenery_density: float = 1.0, bays: bool = True,
-              jitter: float = 0.0, blockages: int = 0) -> "World":
+              jitter: float = 0.0, blockages: int = 0,
+              drive_side: str = "right") -> "World":
         """Build from a road spec (a kind name like `"roundabout_yield"`, or a
         full spec dict). Scenery placement is seeded, so the same spec and the
         same seed give the same town every time.
@@ -110,13 +114,20 @@ class World:
         # face.
         from envs import perimeter
         net = perimeter.close_network(net)
-        if bays and net.spec.get("kind") != "parking_lot":
+        # A layout may refuse bays. The seven purpose-built scenarios
+        # declare their own sources and goals, and the bay pass REPLACES a
+        # network's endpoints with the bays it creates — which would delete
+        # the scenario and leave a motorway whose task is to park on the
+        # hard shoulder. Checked with `is not False` because parking_lot's
+        # own spec uses "bays" as an integer count of bays per aisle.
+        if (bays and net.spec.get("attach_bays") is not False
+                and net.spec.get("kind") != "parking_lot"):
             from envs import bays as bays_mod
             net = bays_mod.attach(net, rng)
         objects = scenery.generate(net, rng, density=scenery_density)
         full = dict(net.spec)
         full["scenery_density"] = scenery_density
-        world = cls(net, objects, full)
+        world = cls(net, objects, full, drive_side=drive_side)
         if blockages:
             world.add_blockages(rng, blockages)
         return world

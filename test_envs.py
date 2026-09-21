@@ -432,7 +432,7 @@ def test_vec_env_runs_mixed_scenarios():
         obs = vec.reset()
         assert len(obs) == 2
         assert obs[0]["lidar"].shape == (6, 120), obs[0]["lidar"].shape
-        assert obs[0]["state"].shape == (6, 10)
+        assert obs[0]["state"].shape == (6, 11)
 
         actions = [[vec.action_space.sample() for _ in range(6)]
                    for _ in range(2)]
@@ -829,7 +829,7 @@ def test_contract_is_stable():
     """
     env = TrafficEnv("manhattan", n_agents=6, seed=0)
 
-    obs_shapes = {"state": (10,), "navigation": (6,), "lidar": (120,),
+    obs_shapes = {"state": (11,), "navigation": (6,), "lidar": (120,),
                   "radar": (5, 4), "vehicle": (8,), "budget": (7,)}
     info_keys = {"cost", "active", "events", "budget", "ttc", "route",
                  "vehicle_type", "scenario"}
@@ -868,6 +868,118 @@ def test_contract_is_stable():
     from envs.budgets import as_vector
     assert np.allclose(info["budget"][live],
                        as_vector(info["vehicle_type"][live]))
+
+
+def test_new_scenarios_build_and_drive():
+    """Every one of the seven purpose-built layouts must build, step, and be
+    completable — and must not quietly lose the structure it exists for."""
+    from envs import scenarios
+    from rollout import pure_pursuit
+
+    for kind in scenarios.KINDS:
+        world = World.build(kind, rng=np.random.default_rng(0))
+        assert len(world.net.pieces) > 0, kind
+        assert world.net.sources and world.net.goals, f"{kind} has no journey"
+
+        env = TrafficEnv(kind, n_agents=8, seed=1)
+        obs, info = env.reset()
+        assert info["cost"]["collision"].sum() == 0.0, f"{kind} spawns in collision"
+        for _ in range(60):
+            obs, _r, _t, _tr, info = env.step([pure_pursuit(o) for o in obs])
+        assert np.all(np.isfinite(obs[0]["lidar"]))
+
+
+def test_divided_carriageways_are_one_way_and_separated():
+    """A motorway has a barrier down the middle.
+
+    Two failures this pins, both of which were real: the opposing streams
+    overlapping because the median was treated as a centreline separation
+    rather than a kerb-to-kerb gap, and the slip roads attaching on the
+    MEDIAN side, which put an acceleration lane in the central reserve.
+    """
+    from envs import scenarios
+
+    net = World.build("highway_straight", rng=np.random.default_rng(0)).net
+    carriageways = [p for p in net.pieces if p.lanes >= 3]
+    assert len(carriageways) >= 2
+    for piece in carriageways:
+        assert piece.oneway, "a divided carriageway must be one-way"
+
+    a, b = carriageways[0], carriageways[1]
+    ya = net.nodes[a.node_a][1]
+    yb = net.nodes[b.node_a][1]
+    gap = abs(ya - yb) - a.half_width - b.half_width
+    assert gap > 1.0, f"opposing carriageways overlap: kerb gap {gap:.2f} m"
+
+    # Slip roads leave on the outside, never into the central reserve.
+    ramps = World.build("highway_ramps", rng=np.random.default_rng(0)).net
+    main = [p for p in ramps.pieces if p.lanes >= 3]
+    centre = sum(ramps.nodes[p.node_a][1] for p in main) / len(main)
+    for piece in ramps.pieces:
+        if piece.lanes != 1:
+            continue
+        y = ramps.nodes[piece.node_a][1]
+        carriage = min(main, key=lambda q: abs(ramps.nodes[q.node_a][1] - y))
+        cy = ramps.nodes[carriage.node_a][1]
+        # A ramp point must not sit between the carriageway and the median.
+        if abs(y - cy) > carriage.half_width:
+            assert abs(y - centre) > abs(cy - centre) - 1.0, \
+                f"slip road at y={y:.1f} is inside the median"
+
+
+def test_speed_limits_are_per_road():
+    """A motorway is not a 50 km/h road.
+
+    One global limit made the speeding cost charge correct motorway driving,
+    and the only way to satisfy it was to crawl — which on a 1400 m layout
+    meant almost no episode ever finished.
+    """
+    from envs import scenarios
+
+    net = World.build("highway_ramps", rng=np.random.default_rng(0)).net
+    limits = {round(p.speed_limit, 1) for p in net.pieces}
+    assert len(limits) > 1, f"every road has the same limit: {limits}"
+    motorway = max(p.speed_limit for p in net.pieces if p.lanes >= 3)
+    ramp = min(p.speed_limit for p in net.pieces if p.lanes == 1)
+    assert motorway > ramp, "a slip road is not faster than the motorway"
+    assert motorway > 20.0, f"motorway limit is only {motorway * 3.6:.0f} km/h"
+
+    # And the policy is told the limit it is being held to.
+    env = TrafficEnv("highway_ramps", n_agents=4, seed=0)
+    obs, info = env.reset()
+    live = int(np.flatnonzero(info["active"])[0])
+    seen = float(obs[live]["state"][10]) * 30.0
+    assert seen > 0.0, "speed limit missing from the observation"
+
+
+def test_grade_separation_hides_the_road_below():
+    """On the overbridge, the deck and the road beneath must not see or
+    touch each other — they share x and y."""
+    from envs.traffic_env import LEVEL_GAP
+
+    world = World.build("overbridge", rng=np.random.default_rng(0))
+    elevated = [p for p in world.net.pieces if max(p.z0, p.z1) > 1.0]
+    assert elevated, "the overbridge has no elevated piece"
+    assert max(max(p.z0, p.z1) for p in elevated) > LEVEL_GAP, \
+        "the deck is not high enough to clear the road under it"
+
+    env = TrafficEnv("overbridge", n_agents=6, seed=3)
+    env.reset()
+    # The flat deck, not a ramp: a ramp's midpoint is only half the
+    # clearance up, which is inside LEVEL_GAP and legitimately does conflict
+    # with the road below.
+    deck = max(world.net.pieces, key=lambda p: min(p.z0, p.z1))
+    assert min(deck.z0, deck.z1) > LEVEL_GAP, "no flat deck above the gap"
+    x, y = deck.point(deck.length / 2.0)
+    a, b = env.vehicles[0], env.vehicles[1]
+    a.x, a.y, b.x, b.y = x, y, x, y
+    env._active[:2] = True
+    env._veh_z[0] = deck.elevation(deck.length / 2.0)
+    env._veh_z[1] = 0.0
+    rects = env._rects()
+    assert len(env._same_level(rects, 0)) == 0 or \
+        not env.world.rect_hits_rects(rects[0], env._same_level(rects, 0)).any(), \
+        "a vehicle on the deck collided with one underneath it"
 
 
 def test_png_round_trip():

@@ -55,6 +55,12 @@ def close_network(net: RoadNetwork, margin: float = RING_MARGIN,
     bay is a legitimate dead end and must not be extended to the ring, and
     running this first means the bay pass simply never sees one.
     """
+    # A layout may declare itself open. A motorway ends at the edge of the
+    # map because the real road continues beyond it, and ringing it would
+    # produce a bypass loop around a motorway, which exists nowhere.
+    if not net.spec.get("closed", True):
+        return net.finalize()
+
     dead = _dangling(net)
     if not dead:
         return net.finalize()

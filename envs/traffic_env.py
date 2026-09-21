@@ -108,6 +108,13 @@ LOOKAHEAD_FAR = 18.0
 COST_CHANNELS = ("collision", "offroad", "wrong_way", "lane_keep",
                  "ttc", "jerk", "speeding")
 
+# Two vehicles this far apart vertically cannot touch or see each other.
+# A bridge deck and the road beneath it occupy the same x/y, and without a
+# height test every vehicle on the bridge would collide with one below it
+# and every lidar would return the deck as a wall. Sized above the tallest
+# vehicle (a 3.2 m bus) and below a realistic headroom (5.0-5.5 m).
+LEVEL_GAP = 4.0
+
 # -- sensor noise ---------------------------------------------------------
 # A policy trained on exact sensors learns to trust them exactly, and the
 # first thing it meets on hardware is a lidar return that is 3 cm out and a
@@ -131,6 +138,9 @@ YAW_RATE_SIGMA = 0.01        # rad/s
 
 # -- cost thresholds (what counts as a violation, NOT what it is worth) ---
 TTC_THRESHOLD = 2.0          # seconds; below this the TTC cost is charged
+# Fallback only. The limit that is actually charged is the one on the road
+# the vehicle is standing on — see RoadNetwork.speed_limit_at. A single
+# global limit made a motorway a 50 km/h road.
 SPEED_LIMIT = 13.9           # m/s (50 km/h)
 
 # Comfort. Jerk is measured from a SMOOTHED acceleration, not from the raw
@@ -278,7 +288,8 @@ class TrafficEnv(gym.Env):
         self.action_space = self.vehicles[0].action_space
         self.observation_space = spaces.Dict({
             # [vx, vy, yaw_rate, steering_angle, gear, road_margin,
-            #  heading_error, lane_offset, lane_index_norm, wrong_way]
+            #  heading_error, lane_offset, lane_index_norm, wrong_way,
+            #  speed_limit]
             #
             # `lane_offset` is measured from the centre of the vehicle's OWN
             # lane, not from the road's centreline: on a three-lane arterial
@@ -286,7 +297,7 @@ class TrafficEnv(gym.Env):
             # metres and carries no information about whether it is driving
             # well. Absolute x/y are deliberately absent — a policy given its
             # world coordinates memorises the map.
-            "state": spaces.Box(-np.inf, np.inf, shape=(10,), dtype=np.float32),
+            "state": spaces.Box(-np.inf, np.inf, shape=(11,), dtype=np.float32),
             # [route_dist, near wp forward, near wp left,
             #  far wp forward, far wp left, bend ahead]
             "navigation": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
@@ -322,6 +333,10 @@ class TrafficEnv(gym.Env):
         # envs/route.py for the 255 m reward jumps that caused.
         self._routes: list = [None] * self.n_agents
         self._prev_xy = np.zeros((self.n_agents, 2))
+        # Road-surface height under each vehicle. Zero on a flat map; on a
+        # grade separation it is what keeps the deck and the road beneath it
+        # from seeing each other.
+        self._veh_z = np.zeros(self.n_agents)
         self._age = np.zeros(self.n_agents, dtype=int)
         self._active = np.zeros(self.n_agents, dtype=bool)
         self._wait = np.zeros(self.n_agents)     # seconds until arrival
@@ -530,6 +545,12 @@ class TrafficEnv(gym.Env):
                                               self.half_length,
                                               self.half_width)], dtype=float)
 
+    def _same_level(self, rects: np.ndarray, i: int) -> np.ndarray:
+        """Every other vehicle within `LEVEL_GAP` of this one's height."""
+        near = np.abs(self._veh_z - self._veh_z[i]) < LEVEL_GAP
+        near[i] = False
+        return rects[near]
+
     def vehicle_rects(self) -> np.ndarray:
         """Footprints of the vehicles actually ON the road — what a renderer
         wants. `_rects` keeps a row per agent, including the ones parked far
@@ -564,6 +585,9 @@ class TrafficEnv(gym.Env):
         if len(actions) != self.n_agents:
             raise ValueError(f"expected {self.n_agents} actions, got {len(actions)}")
 
+        for i, veh in enumerate(self.vehicles):
+            if self._active[i]:
+                self._veh_z[i] = self.world.net.elevation_at(veh.x, veh.y)
         speed_before = np.array([v.vx for v in self.vehicles])
         for veh, action, live in zip(self.vehicles, actions, self._active):
             if live:
@@ -615,9 +639,13 @@ class TrafficEnv(gym.Env):
                 event = "goal"
 
             # -- costs: every guidance term, unweighted --------------------
-            others = np.delete(rects, i, axis=0)
+            others = self._same_level(rects, i)
             hit_vehicle = bool(self.world.rect_hits_rects(rects[i], others).any())
-            hit_static = self.world.hits_scenery(rects[i])
+            # Scenery sits on the ground, so a vehicle up on a deck cannot
+            # strike it. The builders keep buildings off an elevated
+            # alignment for the same reason.
+            hit_static = (abs(self._veh_z[i]) < LEVEL_GAP
+                          and self.world.hits_scenery(rects[i]))
             if hit_vehicle or hit_static:
                 costs["collision"][i] = 1.0
                 terminated[i] = True
@@ -668,7 +696,8 @@ class TrafficEnv(gym.Env):
             costs["jerk"][i] = _ramp(jerk, JERK_THRESHOLD)
 
             speed = math.hypot(veh.vx, veh.vy)
-            costs["speeding"][i] = _ramp(speed, SPEED_LIMIT)
+            limit = self.world.net.pieces[fix.piece].speed_limit
+            costs["speeding"][i] = _ramp(speed, limit)
 
             events.append(event)
 
@@ -735,7 +764,10 @@ class TrafficEnv(gym.Env):
         rel_p = np.delete(moving[:, :2] - moving[i, :2], i, axis=0)
         rel_v = np.delete(moving[:, 2:] - moving[i, 2:], i, axis=0)
         reach = np.delete(radii + radii[i], i)
-        live = np.delete(self._active, i)
+        # Same height test as the collision: a vehicle on the deck is not in
+        # conflict with one passing underneath it.
+        level = np.abs(self._veh_z - self._veh_z[i]) < LEVEL_GAP
+        live = np.delete(self._active & level, i)
         if not live.any():
             return math.inf
         rel_p, rel_v, reach = rel_p[live], rel_v[live], reach[live]
@@ -786,9 +818,16 @@ class TrafficEnv(gym.Env):
             # Other vehicles are obstacles to the lidar exactly as buildings
             # are; the beam does not know the difference and neither should
             # the observation.
-            boxes = np.vstack([static_boxes, np.delete(rects, i, axis=0)])
+            # Only what this vehicle could actually see: traffic at its own
+            # height, and ground scenery only if it is itself near ground.
+            visible = self._same_level(rects, i)
+            boxes = (np.vstack([static_boxes, visible])
+                     if abs(self._veh_z[i]) < LEVEL_GAP else visible)
+            circles = (self.world.static_circles
+                       if abs(self._veh_z[i]) < LEVEL_GAP
+                       else np.zeros((0, 3), dtype=np.float32))
             ranges = sensors.lidar((veh.x, veh.y), veh.heading, boxes,
-                                   self.world.static_circles,
+                                   circles,
                                    n_rays=LIDAR_RAYS, max_range=LIDAR_RANGE)
 
             nf, nl = self._to_ego(veh, near)
@@ -804,6 +843,10 @@ class TrafficEnv(gym.Env):
                     float(veh.gear.value), margin,
                     wrap_pi(veh.heading - tangent),
                 fix.offset, lane_norm, float(fix.wrong_way),
+                # The limit HERE, scaled. Without it a policy cannot tell a
+                # motorway from a side street, and the speeding constraint
+                # would be asking it to guess.
+                self.world.net.pieces[fix.piece].speed_limit / 30.0,
             ], dtype=np.float32)
             navigation = np.array([
                 route, nf, nl, ff, fl, wrap_pi(bend - veh.heading),
@@ -866,7 +909,7 @@ class TrafficEnv(gym.Env):
         """The observation of a vehicle that is not on the road. Zeros, and
         the lidar at full range — the shape the space promises, carrying no
         claim about a world this vehicle is not in."""
-        return {"state": np.zeros(10, dtype=np.float32),
+        return {"state": np.zeros(11, dtype=np.float32),
                 "navigation": np.zeros(6, dtype=np.float32),
                 "lidar": np.full(LIDAR_RAYS, LIDAR_RANGE, dtype=np.float32),
                 "radar": np.zeros((RADAR_OBJECTS, 4), dtype=np.float32),

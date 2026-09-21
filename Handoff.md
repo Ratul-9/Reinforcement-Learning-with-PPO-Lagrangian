@@ -49,7 +49,7 @@ always rectangular** — an agent waiting to arrive still has a row.
 
 | key | shape | contents |
 |---|---|---|
-| `state` | `(10,)` | vx, vy, yaw rate, steering angle, gear, road margin, heading error, lane offset, lane index, wrong-way flag |
+| `state` | `(11,)` | vx, vy, yaw rate, steering angle, gear, road margin, heading error, lane offset, lane index, wrong-way flag, posted speed limit (÷30) |
 | `navigation` | `(6,)` | route distance, near waypoint (fwd, left), far waypoint (fwd, left), bend ahead |
 | `lidar` | `(120,)` | 360° sweep, metres, clipped to 100 |
 | `radar` | `(5, 4)` | nearest 5 movers: fwd, left, rel fwd speed, rel left speed |

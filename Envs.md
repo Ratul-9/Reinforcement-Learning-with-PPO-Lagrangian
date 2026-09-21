@@ -85,7 +85,7 @@ higher than the density you want, or pass `initial_active=1.0,
 arrival_spread=0.0, respawn_delay=0.0` for the old fixed-density behaviour.
 
 ```bash
-python test_envs.py                        # 37 checks, run after any change
+python test_envs.py                        # 41 checks, run after any change
 python fleet.py                            # the vehicle table
 python -m envs.budgets                     # the budget table
 python -m envs.vec                         # parallel throughput benchmark
@@ -97,7 +97,74 @@ python -m envs.png_map intersection_x      # intersection_x_map.png — a painta
 
 ---
 
-## The eight scenarios
+## The seven training scenarios
+
+`envs/scenarios.py`. Built to real road geometry; the older eight below are
+kept buildable for regression but these are the set.
+
+| kind | what it is |
+|---|---|
+| `highway_straight` | 3-lane dual carriageway, divided, both directions |
+| `cross_two_lane` | crossroads of two single-lane-each-way roads |
+| `roundabout_v2` | one-way circulatory carriageway with approach arms |
+| `highway_ramps` | on-ramp and off-ramp with speed-change lanes |
+| `highway_parking` | motorway → off-ramp → service road → car park |
+| `turn_lanes` | lane change into dedicated left / ahead / right lanes |
+| `overbridge` | grade separation: a deck over a road, with 5% ramps |
+
+Three things had to be built for these, and each is load-bearing:
+
+**One-way carriageways.** A divided road is two one-way pieces with a
+kerb-to-kerb median between them, not one wide two-way piece — a motorway
+has a barrier down the middle. A one-way piece carries every lane in the
+same direction, so a 3-lane carriageway is three lanes, not one and a half
+each way.
+
+**Elevation.** Pieces carry a height at each end, linear between. The
+overbridge deck and the road beneath share x and y, so collision, lidar and
+TTC all filter by height (`LEVEL_GAP = 4 m`): a vehicle on the deck cannot
+see, hit or be in conflict with one underneath. Ramps are held at 5%, which
+fixes their length from the clearance — 110 m for a 5.5 m deck.
+
+**Per-road speed limits.** Motorway 100, slip road 60, street 50, car park
+20 km/h. One global limit made a motorway a 50 km/h road, so the `speeding`
+cost charged correct motorway driving and the only way to satisfy it was to
+crawl — on a 1400 m layout that meant almost no episode ever finished. The
+posted limit is in the observation, because a policy cannot otherwise tell
+a motorway from a side street.
+
+### Traffic side is a toggle
+
+`World.build(..., drive_side="left")` or `"right"`. Everything downstream —
+spawns, `wrong_way`, which lane a waypoint is shifted into, which lane a
+vehicle belongs in — reads the lane graph, so one flag flips all of it
+consistently. Default is `"right"`.
+
+### Open boundaries
+
+All seven are marked `closed: False`, so the perimeter ring is skipped: an
+arm stops at the map edge because the real road continues beyond it. They
+also decline parking bays (`attach_bays: False`), since each declares its
+own journey and the bay pass would replace those endpoints.
+
+Measured with the scripted driver, 16 agents, 900 steps:
+
+| scenario | goal | collision | off-road | episodes |
+|---|---|---|---|---|
+| highway_straight | 25.7% | 74.3% | 0.0% | 35 |
+| cross_two_lane | 48.3% | 46.7% | 5.0% | 60 |
+| roundabout_v2 | 21.7% | 66.7% | 11.6% | 69 |
+| highway_ramps | 10.2% | 50.8% | 39.0% | 59 |
+| highway_parking | 12.8% | 39.5% | 47.7% | 86 |
+| turn_lanes | 31.1% | 42.6% | 26.2% | 61 |
+| overbridge | 24.1% | 43.7% | 32.2% | 87 |
+
+The driver has no collision avoidance, so its crash rate is information
+about conflict density rather than a failure.
+
+---
+
+## The eight earlier scenarios
 
 Built parametrically by `road_network.build(kind)`, in curriculum order.
 Each declares its own source and destination points and mixes carriageway

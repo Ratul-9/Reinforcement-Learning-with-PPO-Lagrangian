@@ -19,9 +19,19 @@ Offsets are signed lateral distances from the piece's own centreline,
 **positive to the LEFT of the piece's tangent** — the same sign
 `_Piece.closest` returns, so nothing has to be flipped at the boundary.
 
-Right-hand traffic. A lane on the right half of the carriageway (negative
-offset) carries traffic along +tangent; one on the left half carries traffic
-against it:
+**Which side traffic drives on is a parameter**, not a constant. Under
+right-hand traffic a lane on the right half of the carriageway (negative
+offset) carries traffic along +tangent; under left-hand traffic the left
+half does. Everything downstream — spawns, the wrong-way cost, the lane a
+route waypoint is shifted into, which lane a vehicle belongs in — reads the
+lane graph, so one flag flips all of it consistently.
+
+A ONE-WAY piece ignores the side rule entirely: every lane runs +tangent,
+across the full width. A dual carriageway, a slip road and a gyratory are
+one-way, and modelling a three-lane motorway carriageway as two-way would
+give it one and a half lanes in each direction.
+
+Under two-way traffic:
 
     lanes = 1   one bidirectional lane on the centreline. A parking bay or a
                 single-track aisle: there is no wrong side of a road this
@@ -75,17 +85,30 @@ class LaneFix(NamedTuple):
     on_road: bool
 
 
-def lanes_of(piece) -> list[Lane]:
-    """The lanes of one piece, left to right."""
+def lanes_of(piece, drive_side: str = "right") -> list[Lane]:
+    """The lanes of one piece, left to right across the carriageway."""
     n = max(1, int(piece.lanes))
     width = 2.0 * piece.half_width / n
+
+    if getattr(piece, "oneway", False):
+        # Every lane runs the piece's own way; no wrong side exists.
+        return [Lane(k, piece.half_width - (k + 0.5) * width, 1, width)
+                for k in range(n)]
+
     if n == 1:
         return [Lane(0, 0.0, 0, width)]
+
+    # Under right-hand traffic the nearside is the right of travel, which is
+    # the NEGATIVE offset half; under left-hand traffic it is the positive
+    # half. One sign carries the whole difference.
+    keep_left = drive_side == "left"
     out = []
     for k in range(n):
         offset = piece.half_width - (k + 0.5) * width
         if n % 2 == 1 and k == n // 2:
             direction = 0                     # the shared centre lane
+        elif keep_left:
+            direction = 1 if offset > 0.0 else -1
         else:
             direction = -1 if offset > 0.0 else 1
         out.append(Lane(k, offset, direction, width))
@@ -95,9 +118,13 @@ def lanes_of(piece) -> list[Lane]:
 class LaneGraph:
     """Lanes for a whole network. Built once per World, read every step."""
 
-    def __init__(self, net):
+    def __init__(self, net, drive_side: str = "right"):
+        if drive_side not in ("left", "right"):
+            raise ValueError(f"drive_side must be 'left' or 'right', "
+                             f"got {drive_side!r}")
         self.net = net
-        self._lanes = [lanes_of(p) for p in net.pieces]
+        self.drive_side = drive_side
+        self._lanes = [lanes_of(p, drive_side) for p in net.pieces]
 
     def __len__(self) -> int:
         return sum(len(l) for l in self._lanes)
@@ -155,9 +182,11 @@ class LaneGraph:
         want = 1 if forward else -1
         mine = [ln for ln in lanes if ln.direction == want]
         if mine:
-            # Rightmost in the direction of travel: for +tangent that is the
-            # most negative offset, for -tangent the most positive.
-            return min(mine, key=lambda ln: ln.offset * want)
+            # The NEARSIDE lane — the one a vehicle not overtaking belongs
+            # in. Under right-hand traffic that is the most negative offset
+            # relative to travel; under left-hand traffic the most positive.
+            sign = want if self.drive_side == "right" else -want
+            return min(mine, key=lambda ln: ln.offset * sign)
         return next((ln for ln in lanes if ln.direction == 0), lanes[0])
 
 

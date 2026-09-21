@@ -32,7 +32,7 @@ from envs import road_network
 from envs.metrics import EpisodeRecorder
 from envs.traffic_env import TrafficEnv, COST_CHANNELS
 
-TARGET_SPEED = 7.0        # m/s — brisk for a town, slow enough to take a bend
+TARGET_SPEED = 7.0        # m/s — fallback when no limit is observable
 STEER_GAIN = 1.4          # bearing (rad) to steering command
 SLOW_FOR_BEND = 0.55      # target speed multiplier, scaled by how hard it bends
 
@@ -50,8 +50,13 @@ def pure_pursuit(obs) -> dict:
 
     # Ease off for a corner, using the bend the route makes ahead rather than
     # the yaw rate: by the time a vehicle is yawing it is already in the bend.
+    # Drive to the POSTED limit, not one global speed. Targeting 7 m/s on a
+    # 100 km/h motorway meant a 1400 m scenario could not be finished inside
+    # the episode clock, and almost no episode ever completed.
+    limit = float(obs["state"][10]) * 30.0 if len(obs["state"]) > 10 else 0.0
+    cruise = 0.85 * limit if limit > 0.0 else TARGET_SPEED
     ease = 1.0 - SLOW_FOR_BEND * min(abs(float(bend)) / (math.pi / 2), 1.0)
-    target = TARGET_SPEED * max(ease, 0.25)
+    target = cruise * max(ease, 0.25)
     # Never ask for more than this vehicle has. The last element of the
     # `vehicle` block is its governed top speed, scaled by 50 m/s — a tuktuk
     # tops out at 15 m/s, and a controller demanding 7 m/s uphill of that is
